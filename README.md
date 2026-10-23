@@ -6,6 +6,8 @@ saves a clean playlist (logos, EPG and player options kept).
 
 Project page: https://github.com/antoxa78/PyPlaylist-Checker
 
+[![Donate with PayPal](https://img.shields.io/badge/Donate-PayPal-00457C?logo=paypal&logoColor=white)](https://www.paypal.com/paypalme/antoxab1978)
+
 ## Folder contents
 
 | Path | What it is |
@@ -67,3 +69,9 @@ User settings are kept in `~/.config/playlist-checker/settings.json`.
 2. Add an entry at the top of `debian/changelog` with the same version
    (`dch -v 1.0.1` or by hand, keeping the exact format).
 3. Run `./build-deb.sh` – it refuses to build if the two versions differ.
+
+## Support the project
+
+If this program is useful to you, you can support its development with a donation:
+
+[![Donate with PayPal](https://www.paypalobjects.com/en_US/i/btn/btn_donateCC_LG.gif)](https://www.paypal.com/paypalme/antoxab1978)
