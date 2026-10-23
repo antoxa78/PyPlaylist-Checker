@@ -1,0 +1,79 @@
+.TH PLAYLIST-CHECKER 1 "October 2026" "playlist-checker 1.3.3" "User Commands"
+.SH NAME
+playlist-checker \- check IPTV and internet radio playlists for dead streams and duplicates
+.SH SYNOPSIS
+.B playlist-checker
+.RI [ PLAYLIST | URL | LIST.txt ]...
+.br
+.B playlist-checker
+.BR \-\-help " | " \-\-version
+.SH DESCRIPTION
+.B playlist-checker
+is a desktop application that opens TV (IPTV) and internet radio playlists in
+M3U, M3U8, PLS and XSPF format, from files, whole folders (including
+subfolders) or web addresses, and checks every stream.
+.PP
+It recognises HTTP and HTTPS streams, HLS (it tests the real video segment),
+Icecast and Shoutcast radio, and RTMP, RTSP and MMS servers. Per-channel
+User-Agent and Referer settings (#EXTVLCOPT, or url|User-Agent=...) are used
+when checking.
+.PP
+Duplicates (same stream address, optionally same channel name) are marked.
+Groups can be included, excluded, renamed, merged and reordered. A new clean
+playlist can be saved, keeping channel logos, EPG information (tvg-id,
+url-tvg) and player options, optionally as one file per group. A CSV report of
+the check can be exported.
+.SH OPTIONS
+.TP
+.I PLAYLIST
+Playlist files to open at start.
+.TP
+.I URL
+Web addresses (http:// or https://) of playlists to download at start.
+.TP
+.I LIST.txt
+A text file with one playlist address per line. Every playlist is downloaded
+(four at a time) and its channels are added; see LISTS OF PLAYLIST ADDRESSES.
+.TP
+.BR \-h ", " \-\-help
+Show a short help text and exit.
+.TP
+.BR \-V ", " \-\-version
+Show the version and exit.
+.SH LISTS OF PLAYLIST ADDRESSES
+File \(-> Open list of playlist URLs (Ctrl+L) reads a .txt file with one
+address per line. Empty lines and lines starting with #, ; or // are ignored,
+and text before an address is allowed. Addresses that return a single stream
+are added as one channel, local playlist files are opened, and addresses that
+fail are listed at the end. Stop cancels the remaining downloads. With
+Settings \(-> Check new channels automatically after loading, the new channels
+are checked as soon as they are loaded. An example list is installed in
+.IR /usr/share/doc/playlist-checker/examples/ .
+.SH PLAYLIST COLORS
+Every playlist gets its own color: a colored square at the start of each
+channel row and, unless switched off in Settings \(-> Tint rows with the
+playlist color, a light tint of the row. The Playlists list on the left shows
+the colors with the number of channels; click a playlist to show only its
+channels, or its \(OK box to leave it out. Unticked groups and playlists are
+hidden from the channel list (Settings \(-> Hide unticked groups and playlists
+in the channel list), skipped by Check streams and Recheck offline, and left
+out of the saved playlist.
+.SH USER-AGENT
+Some IPTV providers only answer certain players. Settings \(-> User-Agent lets
+the program identify itself as VLC, FFmpeg, mpv, Kodi, ExoPlayer, TiviMate,
+IPTV Smarters, a Samsung or LG smart TV, an Enigma2 receiver, a web browser
+and others, or as any custom text. A User-Agent set inside the playlist for a
+channel (#EXTVLCOPT:http-user-agent or url|User-Agent=...) always wins.
+.SH FILES
+.TP
+.I ~/.config/playlist-checker/settings.json
+User settings (check timeout, User-Agent, duplicate rules, Settings menu options).
+.SH NOTES
+UDP and multicast links can only be tested inside the provider's own network
+and are reported as "not checked".
+.PP
+Channels are played with VLC or mpv when one of them is installed.
+.SH SEE ALSO
+Project page: https://github.com/antoxa78/PyPlaylist-Checker
+.SH AUTHOR
+Anton <anton1978@gmail.com>

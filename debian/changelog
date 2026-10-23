@@ -1,0 +1,119 @@
+playlist-checker (1.3.3) unstable; urgency=medium
+
+  * Fix: a playlist opened after another one was loaded but could stay
+    invisible when a playlist / group filter, search or Show filter was
+    active. Opening playlists now resets the list filters, and the status
+    bar shows how many playlists and channels are loaded.
+  * Playlists opened while a check is running are checked automatically as
+    soon as that check ends.
+
+ -- Anton <anton1978@gmail.com>  Fri, 23 Oct 2026 22:30:00 +0300
+
+playlist-checker (1.3.2) unstable; urgency=medium
+
+  * Fix: Check streams also checked and showed channels of unticked groups
+    and playlists. Check streams, Recheck offline and the automatic check
+    now skip them, and they are hidden from the channel list (click the
+    group / playlist itself, or Show -> Excluded, to see them). Settings ->
+    Hide unticked groups and playlists in the channel list (on by default).
+
+ -- Anton <anton1978@gmail.com>  Fri, 23 Oct 2026 22:20:00 +0300
+
+playlist-checker (1.3.1) unstable; urgency=medium
+
+  * Fix: unticking groups or playlists did not change the totals.
+    "All channels", "All playlists" and the counts per group / playlist now
+    show the included channels (ticked group and ticked playlist), and the
+    status bar and "Included: N of M" update at once.
+  * Excluded channels are shown in grey; Show -> "Included (will be saved)"
+    and "Excluded (unticked)".
+
+ -- Anton <anton1978@gmail.com>  Fri, 23 Oct 2026 22:10:00 +0300
+
+playlist-checker (1.3.0) unstable; urgency=medium
+
+  * Every playlist has its own color: a colored square on each channel row
+    and a light row tint (Settings -> Tint rows with the playlist color).
+    Duplicates stay yellow.
+  * New "Playlists" list on the left: colors, channel and online counts;
+    click to show only one playlist; untick to leave it out when saving.
+  * Colors follow the order of the playlists in a URL list; direct stream
+    links from a URL list belong to that list.
+
+ -- Anton <anton1978@gmail.com>  Fri, 23 Oct 2026 22:00:00 +0300
+
+playlist-checker (1.2.0) unstable; urgency=medium
+
+  * File -> Open list of playlist URLs (.txt), Ctrl+L, also via Open files
+    and the command line: downloads every playlist in the list (4 at a
+    time, Stop cancels), adds direct stream links and local playlists, and
+    lists the addresses that failed with the reason.
+  * Addresses that return a single TV/radio stream (also HLS) are added as
+    one channel instead of being downloaded as a playlist.
+  * Settings -> Check new channels automatically after loading.
+  * Example URL list in /usr/share/doc/playlist-checker/examples/.
+
+ -- Anton <anton1978@gmail.com>  Fri, 23 Oct 2026 21:45:00 +0300
+
+playlist-checker (1.1.5) unstable; urgency=medium
+
+  * Right-click menu (Cut, Copy, Paste, Delete, Select all) in every text
+    field: Add from URL, Search, User-Agent and all dialogs.
+  * Ctrl+C / Ctrl+V / Ctrl+X / Ctrl+A also work with Hebrew, Russian and
+    other non-Latin keyboard layouts; Ctrl+A selects all.
+  * Channel list: paste stream links or copied playlist text as new
+    channels (right-click -> Paste, Ctrl+V, Edit menu); the right-click menu
+    also opens on an empty list.
+
+ -- Anton <anton1978@gmail.com>  Fri, 23 Oct 2026 21:20:00 +0300
+
+playlist-checker (1.1.4) unstable; urgency=medium
+
+  * Project page: https://github.com/antoxa78/PyPlaylist-Checker
+
+ -- Anton <anton1978@gmail.com>  Fri, 23 Oct 2026 21:00:00 +0300
+
+playlist-checker (1.1.3) unstable; urgency=medium
+
+  * About window with a link to the GitHub project page (open / copy).
+  * Help menu: "Project page on GitHub" and "Report a problem…".
+  * Package: Homepage field; project page in the manual page.
+
+ -- Anton <anton1978@gmail.com>  Fri, 23 Oct 2026 20:55:00 +0300
+
+playlist-checker (1.1.2) unstable; urgency=medium
+
+  * Saved playlists, group playlists and reports start with
+    "Playlist Checker" (Settings -> Add "Playlist Checker" to saved file
+    names, on by default), e.g. "Playlist Checker_tv_2026-10-23.m3u8".
+
+ -- Anton <anton1978@gmail.com>  Fri, 23 Oct 2026 20:50:00 +0300
+
+playlist-checker (1.1.1) unstable; urgency=medium
+
+  * Menu icon: add a scalable SVG icon and a /usr/share/pixmaps fallback, so
+    the icon shows in every menu (e.g. Linux Mint Cinnamon) and icon theme.
+  * Replace a menu entry or desktop shortcut created earlier by the
+    stand-alone version, which hid the installed entry and its icon.
+
+ -- Anton <anton1978@gmail.com>  Fri, 23 Oct 2026 20:45:00 +0300
+
+playlist-checker (1.1.0) unstable; urgency=medium
+
+  * Settings -> User-Agent: choose how the app identifies itself (VLC,
+    FFmpeg, mpv, Kodi, GStreamer, ExoPlayer, Media3, Android MediaPlayer,
+    TiviMate, IPTV Smarters, OTT Navigator, Samsung/LG TV, Enigma2,
+    Apple AVPlayer, Chrome, Firefox) or enter a custom one.
+  * The chosen User-Agent is also passed to VLC when playing a channel.
+
+ -- Anton <anton1978@gmail.com>  Fri, 23 Oct 2026 20:35:00 +0300
+
+playlist-checker (1.0.0) unstable; urgency=medium
+
+  * First release.
+  * Check TV and radio streams (HTTP, HLS, Icecast/Shoutcast, RTMP/RTSP/MMS),
+    recheck offline channels, find duplicates, manage groups.
+  * Save clean playlists (dated file names), CSV report, Hebrew/RTL display,
+    detection of old Hebrew/Cyrillic playlist encodings.
+
+ -- Anton <anton1978@gmail.com>  Fri, 23 Oct 2026 20:30:00 +0300

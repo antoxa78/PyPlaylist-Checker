@@ -1,0 +1,15 @@
+#!/bin/sh
+# Remove Python cache files that may have been created next to the program
+# (for example if it was imported as root), so uninstalling leaves nothing behind.
+set -e
+
+case "$1" in
+    remove|purge)
+        rm -rf /usr/share/playlist-checker/__pycache__
+        rmdir --ignore-fail-on-non-empty /usr/share/playlist-checker 2>/dev/null || true
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

@@ -1,0 +1,26 @@
+# Build output
+dist/
+*.deb
+../playlist-checker_*.deb
+
+# Debian build artefacts
+debian/files
+debian/*.substvars
+debian/*.debhelper
+debian/*.debhelper.log
+debian/playlist-checker/
+debian/.debhelper/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Editors / OS
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store

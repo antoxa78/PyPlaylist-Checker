@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 1024 1024">
+  <title>TV &amp; Radio Playlist Checker</title>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1e2978"/>
+      <stop offset="1" stop-color="#0891b2"/>
+    </linearGradient>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="120%">
+      <feGaussianBlur stdDeviation="14"/>
+    </filter>
+  </defs>
+
+  <!-- tile -->
+  <rect x="52" y="64" width="944" height="940" rx="220" fill="#000" opacity="0.35" filter="url(#shadow)"/>
+  <rect x="40" y="40" width="944" height="944" rx="220" fill="url(#bg)"/>
+
+  <!-- antenna -->
+  <g stroke="#fff" stroke-width="34" stroke-linecap="round">
+    <line x1="512" y1="300" x2="400" y2="175"/>
+    <line x1="512" y1="300" x2="624" y2="175"/>
+  </g>
+  <circle cx="400" cy="175" r="30" fill="#fff"/>
+  <circle cx="624" cy="175" r="30" fill="#fff"/>
+
+  <!-- TV -->
+  <rect x="170" y="290" width="684" height="470" rx="70" fill="#fff"/>
+  <rect x="222" y="340" width="580" height="368" rx="40" fill="#11183e"/>
+  <rect x="420" y="760" width="184" height="40" rx="12" fill="#fff"/>
+  <rect x="330" y="795" width="364" height="45" rx="22" fill="#fff"/>
+
+  <!-- play button and radio waves -->
+  <polygon points="445,425 445,625 615,525" fill="#38bdf8"/>
+  <g fill="none" stroke="#7dd3fc" stroke-width="22">
+    <path d="M276.4 570 A70 70 0 0 1 276.4 480"/>
+    <path d="M238.1 602.1 A120 120 0 0 1 238.1 447.9"/>
+  </g>
+
+  <!-- check badge -->
+  <circle cx="780" cy="770" r="168" fill="#fff"/>
+  <circle cx="780" cy="770" r="150" fill="#16a34a"/>
+  <polyline points="708,772 762,828 858,718" fill="none" stroke="#fff" stroke-width="44"
+            stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

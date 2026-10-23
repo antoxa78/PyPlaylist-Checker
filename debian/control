@@ -1,0 +1,27 @@
+Source: playlist-checker
+Section: video
+Priority: optional
+Maintainer: Anton <anton1978@gmail.com>
+Build-Depends: debhelper-compat (= 13)
+Standards-Version: 4.6.2
+Rules-Requires-Root: no
+Homepage: https://github.com/antoxa78/PyPlaylist-Checker
+
+Package: playlist-checker
+Architecture: all
+Depends: ${misc:Depends}, python3 (>= 3.9), python3-tk
+Recommends: vlc | mpv, fonts-dejavu-core
+Suggests: culmus
+Description: check IPTV and internet radio playlists for dead streams
+ Desktop application for TV (IPTV) and internet radio playlists in M3U,
+ M3U8, PLS and XSPF format. Playlists can be opened from files, from whole
+ folders or from a web address.
+ .
+ Every stream is checked: HTTP/HTTPS, HLS (including the real video
+ segment), Icecast and Shoutcast radio, RTMP, RTSP and MMS. Offline and
+ broken channels can be rechecked, duplicates are marked, and groups can be
+ included, excluded, renamed, merged and reordered.
+ .
+ A clean playlist is saved with channel logos, EPG data and player options
+ kept, optionally as one playlist per group, together with a CSV report.
+ Hebrew and other right-to-left channel names are displayed correctly.

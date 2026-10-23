@@ -1,0 +1,16 @@
+[Desktop Entry]
+Type=Application
+Name=TV & Radio Playlist Checker
+Name[he]=בודק רשימות ערוצים לטלוויזיה ורדיו
+GenericName=Playlist Checker
+GenericName[he]=בודק רשימות ערוצים
+Comment=Check IPTV and radio playlists for dead streams and duplicates
+Comment[he]=בדיקת רשימות IPTV ורדיו: ערוצים שלא עובדים וכפילויות
+Exec=playlist-checker %F
+Icon=playlist-checker
+Terminal=false
+StartupNotify=true
+StartupWMClass=Playlistchecker
+Categories=AudioVideo;Video;
+Keywords=IPTV;M3U;M3U8;PLS;playlist;radio;TV;stream;channels;
+MimeType=audio/x-mpegurl;audio/mpegurl;application/vnd.apple.mpegurl;application/x-mpegurl;audio/x-scpls;application/xspf+xml;

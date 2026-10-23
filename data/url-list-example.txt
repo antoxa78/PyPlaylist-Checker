@@ -1,0 +1,22 @@
+# Example list of playlist addresses for TV & Radio Playlist Checker
+#
+# Open it with File -> Open list of playlist URLs (.txt)  (Ctrl+L),
+# or with File -> Open files, or:  playlist-checker my-list.txt
+#
+# One address per line. Every playlist is downloaded and its channels are added.
+# Empty lines and lines starting with  #  ;  //  are ignored.
+# Text before the address is allowed ("Sport: https://...").
+# Direct stream links (a single channel) and local playlist files work too.
+
+# IPTV provider (M3U / M3U Plus link)
+http://provider.example:8080/get.php?username=USER&password=PASS&type=m3u_plus&output=ts
+
+# Public playlists
+https://example.com/iptv/news.m3u
+Radio: https://example.com/radio/stations.m3u8
+
+# A single stream is added as one channel
+https://example.com/live/channel1/index.m3u8
+
+# A playlist file on this computer (relative to this list or a full path)
+my-local-playlist.m3u

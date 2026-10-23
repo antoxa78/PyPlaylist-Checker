@@ -1,0 +1,6 @@
+#!/usr/bin/make -f
+# Pure Python application without a build step: debhelper only installs files
+# (see debian/install and debian/manpages).
+
+%:
+	dh $@
