@@ -40,7 +40,7 @@ sudo apt install dpkg-dev          # usually already installed
 ./build-deb.sh
 ```
 
-Result: `dist/playlist-checker_1.6.2_all.deb`
+Result: `dist/playlist-checker_1.6.5_all.deb`
 
 ### Method 2 – standard Debian tools
 
@@ -49,12 +49,12 @@ sudo apt install debhelper dpkg-dev
 dpkg-buildpackage -us -uc -b
 ```
 
-Result: `../playlist-checker_1.6.2_all.deb`
+Result: `../playlist-checker_1.6.5_all.deb`
 
 ## Install / remove
 
 ```sh
-sudo apt install ./dist/playlist-checker_1.6.2_all.deb
+sudo apt install ./dist/playlist-checker_1.6.5_all.deb
 playlist-checker                    # or find it in the applications menu
 sudo apt remove playlist-checker
 ```

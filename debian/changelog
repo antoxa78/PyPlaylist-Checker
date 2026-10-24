@@ -1,3 +1,43 @@
+playlist-checker (1.6.5) unstable; urgency=medium
+
+  * After the "same picture on several channels" question marks channels as
+    geo-blocked, the status bar keeps the full playlist statistics (online,
+    offline, black screen, geo-blocked, duplicates, total) with the updated
+    counts, instead of showing only how many channels were just marked.
+  * The statistics are rebuilt from the current channel list, so they also
+    stay correct after a recheck that ends with the same-picture question.
+
+ -- Anton <anton1978@gmail.com>  Sat, 24 Oct 2026 19:17:31 +0300
+
+playlist-checker (1.6.4) unstable; urgency=medium
+
+  * A redirect to an address with a bare "blocked" path segment (for
+    example https://cache.example/blocked/index.m3u8) is now recognised as
+    "not available"; previously only names such as blocked-region or
+    blocked-video were found.
+  * A picture that matches a learned "not available" banner is still
+    recognised when the banner has a small animation (up to 10 % of the
+    picture changing); a real live picture is still rejected.
+  * Gzip-compressed HLS answers are decompressed before checking, so the
+    playlist and its real video segments are read instead of the compressed
+    bytes (reported as a plain HTTP 200 before).
+
+ -- Anton <anton1978@gmail.com>  Sat, 24 Oct 2026 18:48:56 +0300
+
+playlist-checker (1.6.3) unstable; urgency=medium
+
+  * New option "Black screen (no programme, only a logo) = offline": a
+    stream that is still (almost) black 8 seconds later is reported offline,
+    counted separately in the result and left out of the saved playlist. It
+    needs ffmpeg and is on by default when ffmpeg is installed.
+  * The "same picture on several channels" question shows a sharp 640 x 360
+    preview of the picture instead of enlarging the small 80 x 45 thumbnail.
+  * Picture-check ffmpeg input options are built in one place, so the
+    thumbnail and preview always use the same User-Agent, Referer and
+    headers.
+
+ -- Anton <anton1978@gmail.com>  Sat, 24 Oct 2026 18:27:33 +0300
+
 playlist-checker (1.6.2) unstable; urgency=medium
 
   * Saved playlists are safe against line breaks: newlines in an XSPF

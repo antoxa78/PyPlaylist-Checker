@@ -24,7 +24,7 @@ Description: check IPTV and internet radio playlists for dead streams
  .
  A clean playlist is saved with channel logos, EPG data and player options
  kept, optionally as one playlist per group, together with a CSV report.
- Channels that only show a "not available in your country" banner are
- detected (server answer, looping placeholder, picture fingerprint with
- ffmpeg) and left out. Hebrew and other right-to-left channel names are
- displayed correctly.
+ Channels that only show a "not available in your country" banner or a
+ black screen are detected (server answer, looping placeholder, picture
+ fingerprint with ffmpeg) and left out. Hebrew and other right-to-left
+ channel names are displayed correctly.

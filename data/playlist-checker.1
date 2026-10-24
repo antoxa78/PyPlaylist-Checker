@@ -1,4 +1,4 @@
-.TH PLAYLIST-CHECKER 1 "October 2026" "playlist-checker 1.6.2" "User Commands"
+.TH PLAYLIST-CHECKER 1 "October 2026" "playlist-checker 1.6.5" "User Commands"
 .SH NAME
 playlist-checker \- check IPTV and internet radio playlists for dead streams and duplicates
 .SH SYNOPSIS
@@ -54,7 +54,7 @@ are checked as soon as they are loaded. An example list is installed in
 Channels that work but only show "not available in your country" get the
 status Geo-blocked and are left out of the saved playlist. They are found by
 the server's answer (HTTP 451, a 403 or web page mentioning your country or
-region, a redirect to a "geoblock" address), by a short looping video
+region, a redirect to a "geoblock", "blocked" or "not available" address), by a short looping video
 instead of a live stream, and \(em when
 .BR ffmpeg (1)
 is installed \(em by a fingerprint (shape, brightness and colours) of the
@@ -69,6 +69,14 @@ geo-blocked": the picture is remembered and recognised on all channels in
 this and later checks. The options are in Settings \(-> Detect geo-blocked
 channels; Check \(-> Find "not available" banners runs the picture check on
 the online channels only.
+.SH BLACK SCREEN
+With
+.BR ffmpeg (1)
+installed, Settings \(-> Black screen (no programme, only a logo) = offline
+(on by default) reports a stream as offline when it shows an almost black,
+still picture twice, 8 seconds apart. Such channels are left out of the saved
+playlist. A short fade to black, a dark moving scene and a black picture with
+a changing logo are not treated as a black screen.
 .SH PLAYLIST COLORS
 Every playlist gets its own color: a colored square at the start of each
 channel row and, unless switched off in Settings \(-> Tint rows with the

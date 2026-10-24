@@ -65,7 +65,7 @@ import tkinter.font as tkfont
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 APP_TITLE = "TV & Radio Playlist Checker"
-APP_VERSION = "1.6.2"
+APP_VERSION = "1.6.5"
 PROJECT_URL = "https://github.com/antoxa78/PyPlaylist-Checker"
 DEFAULT_UA = "VLC/3.0.20 LibVLC/3.0.20"
 # Settings -> User-Agent. Some IPTV providers only answer certain players/apps.
@@ -147,8 +147,8 @@ GEO_URL_RE = re.compile(
     r"geo[-_.]?(?:block\w*|restrict\w*|fenc\w*|lock\w*|error|denied|forbidden|filter\w*)|"
     r"not[-_.]?available|unavailable|out[-_.]?of[-_.]?(?:region|country|area)|"
     r"(?:region|country|territory)[-_.]?(?:block\w*|lock\w*|restrict\w*|error|denied)|"
-    r"blocked[-_.]?(?:region|country|content|video|stream)|access[-_.]?denied|no[-_.]?rights|"
-    r"zaglushk\w*|stub[-_.]?video", re.I)
+    r"blocked[-_.]?(?:region|country|content|video|stream)|(?:^|[/_.-])blocked(?:$|[/_.-])|"
+    r"access[-_.]?denied|no[-_.]?rights|zaglushk\w*|stub[-_.]?video", re.I)
 # text of an error page / 403 answer that means "blocked where you are"
 GEO_TEXT_RE = re.compile(
     r"\bgeo|your (?:country|region|location|area|territory)|not available in|outside (?:of )?(?:the )?"
@@ -168,10 +168,15 @@ PIC_MIN_SPREAD = 8.0       # (almost) plain black / one-color frames are not com
 PIC_FRAMES = 3             # frames taken from one download: at 0 s, ~0.8 s and ~1.6 s
 PIC_FRAME_GAP = 0.8        # seconds between them
 PIC_MOVING = 0.006         # > 0.6 % of the picture changes between frames = moving, i.e. live TV
+LEARNED_MOVING = 0.10      # a learned banner may have a small animation; still compare it up to 10 %
 PIC_COLOR_MAX = 20         # colour layouts differing by more than this (0-255 average) are not the same
 PIC_COLOR_GRID = 4         # colour layout: average colour of 4 x 4 areas
 STILL_CHECK_GAP = 8         # seconds between the two pictures of the still-banner test
 SAME_PICTURE_MIN = 3       # this many different channels with one picture = probably a banner
+BLACK_MAX_GRAY = 16        # average brightness (0-255) below this = black screen (a small logo may stay)
+BLACK_CHANGE_MAX = 0.02    # black screen: at most 2 % of the picture changed in STILL_CHECK_GAP seconds
+BLACK_STEP = 4             # ... counting changes of more than 4 brightness steps (dark scenes change little)
+PREVIEW_W, PREVIEW_H = 640, 360   # sharper picture shown when asking about a banner
 
 TCP_PORTS = {"rtmp": 1935, "rtmpe": 1935, "rtmpt": 80, "rtmps": 443, "rtsp": 554, "rtsps": 322,
              "mms": 1755, "mmst": 1755, "mmsh": 80}
@@ -913,6 +918,28 @@ def is_moving(c) -> bool:
     return c.pic_motion is not None and c.pic_motion > PIC_MOVING
 
 
+def looks_black(pic) -> bool:
+    """A grab_picture() result that is (almost) black and still: no programme, at most a logo.
+    The brightness decides, not the contrast - a bright channel logo on black has high contrast."""
+    if pic is None:
+        return False
+    motion = picture_extras(pic)[0]       # a blinking "live" sign on the logo may move a little
+    return pic[2] < BLACK_MAX_GRAY and (motion is None or motion <= BLACK_CHANGE_MAX)
+
+
+def still_black(first, second) -> bool:
+    """Both pictures, taken STILL_CHECK_GAP seconds apart, are black and (almost) the same -
+    not a fade to black or a dark scene, the channel shows nothing."""
+    if not (looks_black(first) and looks_black(second)):
+        return False
+    a, b = parse_ppm(first[3]), parse_ppm(second[3])
+    if not a or not b or a[:2] != b[:2]:
+        return True
+    # a dark scene changes only a little in brightness: count small changes too
+    # (a black slate from an encoder is the same picture every time, it changes by 0)
+    return frame_motion(a[2], b[2], BLACK_STEP) <= BLACK_CHANGE_MAX
+
+
 def parse_ppms(data: bytes) -> list:
     """All frames ffmpeg wrote one after another: [(w, h, pixels, raw PPM bytes), ...]."""
     frames, pos = [], 0
@@ -935,10 +962,10 @@ def gray_pixels(px: bytes) -> list:
     return [(px[i] * 299 + px[i + 1] * 587 + px[i + 2] * 114) // 1000 for i in range(0, len(px), 3)]
 
 
-def frame_motion(a: bytes, b: bytes) -> float:
-    """Share of the picture whose brightness changed noticeably between two frames."""
+def frame_motion(a: bytes, b: bytes, step: int = 12) -> float:
+    """Share of the picture whose brightness changed noticeably (by more than `step`) between two frames."""
     ga, gb = gray_pixels(a), gray_pixels(b)
-    return sum(1 for x, y in zip(ga, gb) if abs(x - y) > 12) / max(len(ga), 1)
+    return sum(1 for x, y in zip(ga, gb) if abs(x - y) > step) / max(len(ga), 1)
 
 
 def color_layout(w: int, h: int, px: bytes, n: int = PIC_COLOR_GRID) -> list:
@@ -1124,7 +1151,11 @@ class StreamChecker:
                 ctype = (r.headers.get("Content-Type") or "").split(";")[0].strip().lower()
                 final_url = r.geturl()
                 deadline = time.monotonic() + self.timeout
-                data = read_some(r, 2048, deadline)
+                # some servers send an HLS playlist gzip-compressed even without Accept-Encoding;
+                # read through GzipFile so #EXTM3U is visible and the real segments are checked
+                encoding = (r.headers.get("Content-Encoding") or "").split(",")[0].strip().lower()
+                stream = gzip.GzipFile(fileobj=r) if encoding in ("gzip", "x-gzip") else r
+                data = read_some(stream, 2048, deadline)
                 head = data.lstrip(b"\xef\xbb\xbf \t\r\n")
                 is_hls = (head.startswith(b"#EXTM3U")
                           and HLS_TAG_BYTES_RE.search(head) is not None)
@@ -1132,12 +1163,12 @@ class StreamChecker:
                 if is_hls:
                     # rest of the HLS playlist - channels with a long rewind window (24 h of
                     # 6-second segments) have playlists of 1-2 MB
-                    rest, complete = read_upto(r, HLS_MAX_BYTES, deadline)
+                    rest, complete = read_upto(stream, HLS_MAX_BYTES, deadline)
                     data += rest
                 elif depth > 0:
-                    data += read_some(r, 65536 - len(data), deadline)  # video segment: fingerprint
+                    data += read_some(stream, 65536 - len(data), deadline)  # video segment: fingerprint
                 elif ctype.startswith("text/html"):
-                    data += read_some(r, 65536 - len(data), deadline)  # error page: look for "your country"
+                    data += read_some(stream, 65536 - len(data), deadline)  # error page: look for "your country"
         except urllib.error.HTTPError as e:
             if self.geo_server:
                 if e.code == 451:
@@ -1253,21 +1284,9 @@ class StreamChecker:
         much of the picture changes between the frames (None when only one frame came)."""
         if not self.ffmpeg:
             return None
-        url, extra_headers = split_url_headers(url.strip())
-        url = request_url(url)
-        ua = extra_headers.pop("User-Agent", None) or ua or self.ua
-        referer = extra_headers.pop("Referer", None) or referer
-        cmd = [self.ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin",
-               "-analyzeduration", "2000000", "-probesize", "1500000"]
-        if url.lower().startswith(("http://", "https://")):
-            cmd += ["-rw_timeout", str(int(self.timeout * 1_000_000)), "-user_agent", ua]
-            hdrs = ([("Referer", referer)] if referer else []) + list(extra_headers.items())
-            if hdrs:
-                cmd += ["-headers", "".join(f"{k}: {v}\r\n" for k, v in hdrs)]
-        if hls:
-            cmd += ["-live_start_index", "-1"]   # only the newest segment
-        cmd += ["-threads", "1", "-i", url, "-map", "0:v:0",
-                "-vf", f"select='eq(n\\,0)+gte(t-prev_selected_t\\,{PIC_FRAME_GAP})',scale={PIC_W}:{PIC_H}"]
+        cmd = self._ffmpeg_input(url, ua, referer, hls) + [
+            "-map", "0:v:0",
+            "-vf", f"select='eq(n\\,0)+gte(t-prev_selected_t\\,{PIC_FRAME_GAP})',scale={PIC_W}:{PIC_H}"]
         tail = ["-frames:v", str(PIC_FRAMES), "-f", "image2pipe", "-vcodec", "ppm", "-"]
         prints: list = []
 
@@ -1297,6 +1316,38 @@ class StreamChecker:
         usable = [f[2] for f, fp in zip(frames, prints) if fp[1] >= PIC_MIN_SPREAD] or [f[2] for f in frames]
         motion = max((frame_motion(a, b) for a, b in zip(usable, usable[1:])), default=None)
         return bits, spread, mean, raw, motion, color_layout(w, h, px)
+
+    def _ffmpeg_input(self, url: str, ua: str | None, referer: str | None, hls: bool) -> list:
+        """ffmpeg command up to and including '-i address' (User-Agent, Referer, extra headers)."""
+        url, extra_headers = split_url_headers(url.strip())
+        url = request_url(url)
+        ua = extra_headers.pop("User-Agent", None) or ua or self.ua
+        referer = extra_headers.pop("Referer", None) or referer
+        cmd = [self.ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin",
+               "-analyzeduration", "2000000", "-probesize", "1500000"]
+        if url.lower().startswith(("http://", "https://")):
+            cmd += ["-rw_timeout", str(int(self.timeout * 1_000_000)), "-user_agent", ua]
+            hdrs = ([("Referer", referer)] if referer else []) + list(extra_headers.items())
+            if hdrs:
+                cmd += ["-headers", "".join(f"{k}: {v}\r\n" for k, v in hdrs)]
+        if hls:
+            cmd += ["-live_start_index", "-1"]   # only the newest segment
+        return cmd + ["-threads", "1", "-i", url]
+
+    def grab_preview(self, url: str, ua: str | None = None, referer: str | None = None,
+                     hls: bool = False) -> bytes | None:
+        """One sharper frame (at most PREVIEW_W x PREVIEW_H, true shape of the picture) as PPM -
+        only for showing to the user, the 80 x 45 thumbnail is too small to read a banner."""
+        if not self.ffmpeg:
+            return None
+        # sar: SD channels often have non-square pixels - show them with the shape the TV shows
+        cmd = self._ffmpeg_input(url, ua, referer, hls) + [
+            "-map", "0:v:0", "-vf",
+            ("scale='trunc(iw*if(gt(sar\\,0)\\,sar\\,1)/2)*2':ih,"
+             f"scale={PREVIEW_W}:{PREVIEW_H}:force_original_aspect_ratio=decrease,setsar=1"),
+            "-frames:v", "1", "-f", "image2pipe", "-vcodec", "ppm", "-"]
+        frames, _ = self._read_frames(cmd, lambda f: len(f) >= 1)
+        return frames[0][3] if frames else None
 
     def _read_frames(self, cmd, enough) -> tuple[list, bytes]:
         """Run ffmpeg and collect the frames as they arrive; stop it as soon as enough(frames)
@@ -1701,7 +1752,7 @@ SETTING_TYPES = {
 BOOL_SETTINGS = ("deep_hls", "ignore_ssl", "dup_url", "dup_name", "dup_quality", "hide_hidden", "date_names",
                  "prefix_names", "bidi_fix", "confirm_exit", "auto_check", "tint_rows", "hide_excluded",
                  "remember_ticks", "geo_server", "geo_loop", "geo_picture", "geo_ask", "click_play",
-                 "replace_player", "retry_temporary")
+                 "replace_player", "retry_temporary", "black_screen")
 
 
 def clean_settings(data: dict) -> dict:
@@ -1818,7 +1869,8 @@ def ppm_to_photo(master, ppm: bytes) -> tk.PhotoImage | None:
 class SamePictureDialog(tk.Toplevel):
     """Several channels show exactly the same picture: probably a 'not available in your country' banner."""
 
-    def __init__(self, parent, members, ppm: bytes | None, distinct: int | None = None):
+    def __init__(self, parent, members, ppm: bytes | None, distinct: int | None = None,
+                 preview: bytes | None = None):
         super().__init__(parent)
         self.result = None
         self.title("Same picture on several channels")
@@ -1826,26 +1878,31 @@ class SamePictureDialog(tk.Toplevel):
         self.resizable(False, False)
         body = ttk.Frame(self, padding=14)
         body.pack(fill="both", expand=True)
-        if ppm:
+        # the sharp preview (taken just now) when there is one, else the small thumbnail enlarged
+        self._img = None
+        for data, zoom in ((preview, 1), (ppm, 3)):
+            if not data:
+                continue
             try:
-                img = ppm_to_photo(self, ppm)
-                if img is None:
-                    raise tk.TclError("no image")
-                self._img = img.zoom(3)
-                ttk.Label(body, image=self._img, relief="solid").grid(row=0, column=0, rowspan=2, sticky="n",
-                                                                       padx=(0, 14))
+                img = ppm_to_photo(self, data)
             except tk.TclError:
-                pass
-        ttk.Label(body, wraplength=380, justify="left",
+                img = None
+            if img is not None:
+                self._img = img.zoom(zoom) if zoom > 1 else img
+                break
+        wrap = max(480, self._img.width() if self._img else 0)
+        if self._img:
+            ttk.Label(body, image=self._img, relief="solid").grid(row=0, column=0, sticky="n", pady=(0, 12))
+        ttk.Label(body, wraplength=wrap, justify="left",
                   text=vis(f"{distinct or len(members)} different channels ({len(members)} streams) show "
                            "exactly this picture, and it did not change a few seconds later.\n\n"
                            "This is usually a “not available in your country” banner (or another "
                            "placeholder). Mark them as geo-blocked? They will be left out when saving, "
                            "and the program will recognise this picture in future checks.")
-                  ).grid(row=0, column=1, sticky="nw")
+                  ).grid(row=1, column=0, sticky="nw")
         lf = ttk.Frame(body)
-        lf.grid(row=1, column=1, sticky="nsew", pady=(10, 0))
-        lb = tk.Listbox(lf, height=min(8, len(members)), width=48, activestyle="none")
+        lf.grid(row=2, column=0, sticky="nsew", pady=(10, 0))
+        lb = tk.Listbox(lf, height=min(6, len(members)), width=48, activestyle="none")
         for m in members:
             lb.insert("end", vis(f"{m.name}   ({m.group or NO_GROUP})"))
         sb = ttk.Scrollbar(lf, orient="vertical", command=lb.yview)
@@ -1853,7 +1910,7 @@ class SamePictureDialog(tk.Toplevel):
         lb.pack(side="left", fill="both", expand=True)
         sb.pack(side="right", fill="y")
         bf = ttk.Frame(body)
-        bf.grid(row=2, column=0, columnspan=2, sticky="e", pady=(14, 0))
+        bf.grid(row=3, column=0, sticky="e", pady=(14, 0))
         ttk.Button(bf, text="⛔  Mark as geo-blocked", command=lambda: self._done("block")).pack(side="left", padx=3)
         ttk.Button(bf, text="Not a banner", command=lambda: self._done("not")).pack(side="left", padx=3)
         ttk.Button(bf, text="Decide later", command=lambda: self._done(None)).pack(side="left", padx=3)
@@ -1980,8 +2037,15 @@ class App(tk.Tk):
         self.v_retry = tk.BooleanVar(value=self.settings.get("retry_temporary", True))
         self._retrying = 0
         self._retry_result = None
+        self._finish_text = ""
+        self._finish_stopped = False
+        self._finish_pic_skipped = False
+        self._finish_rechecked: list[int] | None = None
+        self._finish_retry: tuple | None = None
         self.v_geo_picture = tk.BooleanVar(value=self.settings.get("geo_picture", True) and bool(self.ffmpeg))
         self.v_geo_ask = tk.BooleanVar(value=self.settings.get("geo_ask", True))
+        self.v_black = tk.BooleanVar(value=self.settings.get("black_screen", True) and bool(self.ffmpeg))
+        self._banner_pics = False          # this check looks for banners (not only black screens)
         self._thumbs: dict[int, bytes] = {}
         self.pic_total = self.pic_done = 0
         self._pictures_only = False
@@ -2105,6 +2169,9 @@ class App(tk.Tk):
         geo.add_separator()
         geo.add_command(label="Forget learned banners…", command=self.forget_banners)
         m.add_cascade(label="Detect geo-blocked channels", menu=geo)
+        m.add_checkbutton(label="Black screen (no programme, only a logo) = offline" +
+                          ("" if self.ffmpeg else "  (needs ffmpeg)"),
+                          variable=self.v_black, command=self.on_black_option)
         enc = tk.Menu(m, tearoff=0)
         for value, label in LEGACY_ENCODINGS:
             enc.add_radiobutton(label=label, value=value, variable=self.v_encoding, command=self.save_settings)
@@ -2723,7 +2790,9 @@ class App(tk.Tk):
         timeout = min(max(self._int(self.v_timeout, 8), 1), 120) * (2 if recheck else 1)
         threads = min(max(self._int(self.v_threads, 20), 1), 200)
         self.ffmpeg = self.ffmpeg or find_ffmpeg()
-        pictures = (self.v_geo_picture.get() or pictures_only) and bool(self.ffmpeg)
+        black = self.v_black.get() and bool(self.ffmpeg)
+        self._banner_pics = self.v_geo_picture.get() or pictures_only
+        pictures = (self._banner_pics or black) and bool(self.ffmpeg)
         checker = StreamChecker(timeout, self.v_ua.get().strip(), self.v_deep.get(), self.v_ssl.get(),
                                 self.v_geo_server.get(), self.v_geo_loop.get(), self.ffmpeg if pictures else None)
         self._checker = checker
@@ -2757,11 +2826,12 @@ class App(tk.Tk):
         self._retrying = 0
         self._retry_result = None
         retry = self.v_retry.get() and not pictures_only
-        threading.Thread(target=self._check_worker, args=(checker, jobs, threads, pictures, pictures_only, retry),
+        threading.Thread(target=self._check_worker,
+                         args=(checker, jobs, threads, pictures, pictures_only, retry, black),
                          daemon=True).start()
 
     def _check_worker(self, checker: StreamChecker, jobs, threads, pictures: bool, pictures_only: bool,
-                      retry: bool = False):
+                      retry: bool = False, black_check: bool = False):
         stop = self.stop_event
         by_uid = {j[0]: j for j in jobs}
 
@@ -2778,8 +2848,13 @@ class App(tk.Tk):
             _, _, _, ua, ref = by_uid[uid]
             url, hls = pic_src[uid]
             if stop.is_set():
-                return uid, None
-            return uid, checker.grab_picture(url, ua, ref, hls)
+                return uid, None, False
+            pic = checker.grab_picture(url, ua, ref, hls)
+            black = False
+            # black and still can also be a fade-out or a dark scene: look again a bit later
+            if black_check and looks_black(pic) and not stop.wait(STILL_CHECK_GAP):
+                black = still_black(pic, checker.grab_picture(url, ua, ref, hls))
+            return uid, pic, black
 
         def wants_picture(uid, res) -> bool:
             if not pictures or res is None or res[0] != ONLINE or res[3].get("audio"):
@@ -2791,7 +2866,7 @@ class App(tk.Tk):
         pic_ex = ThreadPoolExecutor(max_workers=min(16, max(4, threads // 2))) if pictures else None
         pic_futs: set = set()
 
-        pic_finished: dict[str, object] = {}     # address -> picture already taken
+        pic_finished: dict[str, tuple] = {}      # address -> (picture already taken, black screen)
 
         def queue_picture(uid, extra=None):
             extra = extra or {}
@@ -2799,7 +2874,7 @@ class App(tk.Tk):
             key = norm_url(src[0])
             self.q.put(("pic_queued",))
             if key in pic_finished:              # same stream, its picture is already there
-                self.q.put(("picture", uid, pic_finished[key]))
+                self.q.put(("picture", uid, *pic_finished[key]))
                 return
             if key in pic_same:                  # same stream as a channel already queued
                 pic_same[key].append(uid)
@@ -2819,13 +2894,13 @@ class App(tk.Tk):
                 pic_futs -= done
             for f in done:
                 try:
-                    uid, pic = f.result()
+                    uid, pic, black = f.result()
                 except Exception:
                     continue
                 key = norm_url(pic_src[uid][0])
-                pic_finished[key] = pic
+                pic_finished[key] = (pic, black)
                 for same_uid in pic_same.get(key, [uid]):
-                    self.q.put(("picture", same_uid, pic))
+                    self.q.put(("picture", same_uid, pic, black))
 
         def post(uid, res):
             self.q.put(("result", uid, res))
@@ -2938,31 +3013,16 @@ class App(tk.Tk):
                                         value=int(d.get("done", 0)))
         self.recompute_duplicates()
         self.refresh_all()
-        on = sum(c.status == ONLINE for c in self.channels)
-        off = sum(c.status == OFFLINE for c in self.channels)
-        dups = sum(1 for c in self.channels if c.dup_of)
-        blk = sum(c.status == BLOCKED for c in self.channels)
-        text = (f"{'Stopped' if stopped else 'Check finished'}: {on} online · {off} offline · "
-                f"{blk} geo-blocked · {dups} duplicates · {len(self.channels)} channels total.")
-        if self.pic_total:
-            text += (f" Picture check skipped after {self.pic_done} of {self.pic_total}." if pic_skipped
-                     else f" Pictures checked: {self.pic_done}.")
-        skipped = sum(1 for c in self.channels if not self._included(c))
-        if skipped:
-            text += f" {skipped} in unticked groups / playlists are not included."
-        if self._recheck:
-            rechecked = [uid for uid in self._recheck if uid in self.by_uid]
-            back = sum(1 for uid in rechecked if self.by_uid[uid].status == ONLINE)
-            still_off = sum(1 for uid in rechecked if self.by_uid[uid].status == OFFLINE)
-            still_blk = sum(1 for uid in rechecked if self.by_uid[uid].status == BLOCKED)
-            text = (f"Recheck {'stopped' if stopped else 'finished'}: {back} of {len(rechecked)} offline / "
-                    f"blocked channels are back online · still offline: {still_off} · "
-                    f"geo-blocked: {still_blk}.")
-            self._recheck = None
-        if self._retry_result:
-            back, tried = self._retry_result
-            text += f" {back} of {tried} channels with a temporary error worked on the 2nd try."
+        # keep what happened during this check, so the statistics can be rebuilt after the
+        # same-picture question marks more channels as geo-blocked
+        self._finish_stopped = stopped
+        self._finish_pic_skipped = pic_skipped
+        self._finish_rechecked = ([uid for uid in self._recheck if uid in self.by_uid]
+                                  if self._recheck is not None else None)
+        self._finish_retry = self._retry_result
+        self._recheck = None
         self._retrying, self._retry_result = 0, None
+        text = self._result_text()
         self._finish_text = text
         self.set_status(text)
         pictures_taken = bool(self._thumbs)
@@ -2980,6 +3040,36 @@ class App(tk.Tk):
         self._pending_check = False
         if not stopped:
             self.bell()
+
+    def _result_text(self) -> str:
+        """Statistics of the current playlist after a check, plus what happened in the check.
+        Rebuilt when the same-picture question marks more channels, so the counts stay right."""
+        on = sum(c.status == ONLINE for c in self.channels)
+        off = sum(c.status == OFFLINE for c in self.channels)
+        dups = sum(1 for c in self.channels if c.dup_of)
+        blk = sum(c.status == BLOCKED for c in self.channels)
+        dark = sum(c.status == OFFLINE and c.info.startswith("black screen") for c in self.channels)
+        rechecked = getattr(self, "_finish_rechecked", None)
+        if rechecked is not None:
+            back = sum(1 for uid in rechecked if self.by_uid[uid].status == ONLINE)
+            still_off = sum(1 for uid in rechecked if self.by_uid[uid].status == OFFLINE)
+            still_blk = sum(1 for uid in rechecked if self.by_uid[uid].status == BLOCKED)
+            return (f"Recheck {'stopped' if self._finish_stopped else 'finished'}: {back} of "
+                    f"{len(rechecked)} offline / blocked channels are back online · still offline: "
+                    f"{still_off} · geo-blocked: {still_blk}.")
+        text = (f"{'Stopped' if self._finish_stopped else 'Check finished'}: {on} online · {off} offline"
+                f"{f' ({dark} black screen)' if dark else ''} · "
+                f"{blk} geo-blocked · {dups} duplicates · {len(self.channels)} channels total.")
+        if self.pic_total:
+            text += (f" Picture check skipped after {self.pic_done} of {self.pic_total}."
+                     if self._finish_pic_skipped else f" Pictures checked: {self.pic_done}.")
+        skipped = sum(1 for c in self.channels if not self._included(c))
+        if skipped:
+            text += f" {skipped} in unticked groups / playlists are not included."
+        if self._finish_retry:
+            back, tried = self._finish_retry
+            text += f" {back} of {tried} channels with a temporary error worked on the 2nd try."
+        return text
 
     # ------------------------------------------------------------------ geo-blocked channels
     def _learned(self) -> dict:
@@ -3013,7 +3103,10 @@ class App(tk.Tk):
         if c.seg_hash and c.seg_hash in d["segs"]:
             c.status, c.info = BLOCKED, "same 'not available' video as a channel you marked"
             return True
-        if c.pic_hash is not None and c.pic_spread >= PIC_MIN_SPREAD and not is_moving(c):
+        # a banner can have a small animation (a blinking "live" dot, a moving logo): the
+        # fingerprint and colours still match, so do not reject it just because it moves a little
+        if c.pic_hash is not None and c.pic_spread >= PIC_MIN_SPREAD and \
+                (c.pic_motion is None or c.pic_motion <= LEARNED_MOVING):
             for e in d["pics"]:
                 if self._entry_close(c, e):
                     name = e[2] if len(e) > 2 and isinstance(e[2], str) else "?"
@@ -3139,6 +3232,14 @@ class App(tk.Tk):
         self.ffmpeg = self.ffmpeg or find_ffmpeg()
         self.save_settings()
 
+    def on_black_option(self):
+        if self.v_black.get() and not (self.ffmpeg or find_ffmpeg()):
+            self.v_black.set(False)
+            messagebox.showinfo(APP_TITLE, "The black screen check needs ffmpeg.\n\nInstall it with:\n"
+                                "    sudo apt install ffmpeg\n\nthen switch this option on again.", parent=self)
+        self.ffmpeg = self.ffmpeg or find_ffmpeg()
+        self.save_settings()
+
     def find_banners(self):
         self.ffmpeg = self.ffmpeg or find_ffmpeg()
         if not self.ffmpeg:
@@ -3195,7 +3296,7 @@ class App(tk.Tk):
             return
         self.ffmpeg = self.ffmpeg or find_ffmpeg()
         if not self.ffmpeg:
-            self._show_same_picture(groups, 0)
+            self._show_same_picture([(h, g, ms, None) for h, g, ms in groups], 0)
             return
         self.set_status(getattr(self, "_finish_text", "") + "   Same picture on several channels – "
                         "checking whether it is a still banner or live TV …")
@@ -3227,6 +3328,8 @@ class App(tk.Tk):
                         wait_s = STILL_CHECK_GAP - (time.monotonic() - taken)
                         if wait_s > 0:             # live TV needs a moment to show something else
                             time.sleep(min(wait_s, STILL_CHECK_GAP))
+                        # a sharp picture for the question, taken while the still test runs
+                        preview = ex.submit(checker.grab_preview, *jobs[0]) if jobs else None
                         pics = list(ex.map(lambda j: checker.grab_picture(*j), jobs))
                         cols = members[0].pic_colors
                         moved = any(p is not None and p[1] >= PIC_MIN_SPREAD and
@@ -3236,7 +3339,11 @@ class App(tk.Tk):
                         if moved:
                             live += 1
                         else:
-                            kept.append((h, g, members))
+                            try:
+                                big = preview.result() if preview else None
+                            except Exception:
+                                big = None
+                            kept.append((h, g, members, big))
                 self.q.put(("same_pic_ready", kept, live))
             finally:
                 self._aux_checkers.discard(checker)
@@ -3251,18 +3358,19 @@ class App(tk.Tk):
             return
         if not live:
             self.set_status(getattr(self, "_finish_text", ""))
-        groups = [(h, g, ms) for h, g, ms in
-                  ((h, g, [m for m in members if m.status == ONLINE and m.uid in self.by_uid])
-                   for h, g, members in groups)
+        groups = [(h, g, ms, big) for h, g, ms, big in
+                  ((h, g, [m for m in members if m.status == ONLINE and m.uid in self.by_uid], big)
+                   for h, g, members, big in groups)
                   if count_distinct_channels(ms) >= SAME_PICTURE_MIN]
         if not groups:
             self._thumbs.clear()
             return
         try:
             marked = 0
-            for h, g, members in groups:
+            for h, g, members, big in groups:
                 thumb = next((self._thumbs[m.uid] for m in members if m.uid in self._thumbs), None)
-                answer = SamePictureDialog(self, members, thumb, count_distinct_channels(members)).result
+                answer = SamePictureDialog(self, members, thumb, count_distinct_channels(members),
+                                           preview=big).result
                 d = self._learned()
                 first = members[0]
                 cols = [first.pic_colors] if first.pic_colors else []
@@ -3280,7 +3388,14 @@ class App(tk.Tk):
                 self.save_settings()
                 marked += self._apply_learned_to_all()
                 if marked:
-                    self.set_status(f"{marked} channels marked as geo-blocked – they are left out when saving.")
+                    # keep the full playlist statistics in the status bar; the counts changed
+                    # because the channels above were just marked as geo-blocked
+                    self._finish_text = self._result_text()
+                    live_note = (f"   {live} group(s) of channels showed the same picture, but it "
+                                 "changed a few seconds later – the same live programme, not a banner."
+                                 if live else "")
+                    self.set_status(f"{self._finish_text}{live_note}   {marked} channels marked as "
+                                    "geo-blocked – they are left out when saving.")
         finally:
             self._thumbs.clear()
 
@@ -3310,7 +3425,9 @@ class App(tk.Tk):
         blk = sum(c.status == BLOCKED for c in self.channels)
         if self._pic_phase:
             head = "" if self._pictures_only else f"Streams done ✓ ({on} online · {off} offline)   ·   "
-            return (f"{head}Looking for “not available” banners: picture {self.pic_done} / {self.pic_total}"
+            what = ("“not available” banners and black screens" if self._banner_pics and self.v_black.get()
+                    else "“not available” banners" if self._banner_pics else "black screens")
+            return (f"{head}Looking for {what}: picture {self.pic_done} / {self.pic_total}"
                     f"{self._time_left()} · geo-blocked {blk}   –   “Skip pictures” keeps all results")
         pics = f"   ·   pictures {self.pic_done} / {self.pic_total}" if self.pic_total else ""
         if self._retrying:
@@ -3351,13 +3468,19 @@ class App(tk.Tk):
                     updated = True
                 elif kind == "picture":
                     c = self.by_uid.get(msg[1])
+                    black = len(msg) > 3 and msg[3]
                     if c is not None and msg[2] is not None:
                         c.pic_hash, c.pic_spread, c.pic_gray, thumb = msg[2][:4]
                         c.pic_motion, c.pic_colors = picture_extras(msg[2])
                         c.pic_time = time.monotonic()
-                        if c.pic_spread >= PIC_MIN_SPREAD and not is_moving(c):
-                            self._thumbs[c.uid] = thumb   # only a still picture can be a banner
-                        self._apply_learned(c)
+                        if black and c.status == ONLINE and c.uid not in self._manual_locked:
+                            c.status, c.info = OFFLINE, (
+                                "black screen – the stream works but shows no programme "
+                                f"(black and still, again {STILL_CHECK_GAP} s later)")
+                        elif self._banner_pics:
+                            if c.pic_spread >= PIC_MIN_SPREAD and not is_moving(c):
+                                self._thumbs[c.uid] = thumb   # only a still picture can be a banner
+                            self._apply_learned(c)
                         self._update_row(c)
                     self.pic_done += 1
                     updated = True
@@ -4611,6 +4734,8 @@ class App(tk.Tk):
             "server's answer, by short looping videos and – with ffmpeg installed – by the picture. "
             "Right-click a channel that shows such a banner → “Mark as geo-blocked” and the program "
             "recognises the same banner on all other channels.\n\n"
+            "Black screen: a stream that works but shows only black (maybe with the channel logo) for "
+            f"{STILL_CHECK_GAP}+ seconds counts as offline – Settings → “Black screen … = offline” (needs ffmpeg).\n\n"
             "Tips: some providers block unknown players – keep the VLC User-Agent. "
             "UDP/multicast links can only be tested inside your provider's network."), parent=self)
 
@@ -4707,6 +4832,7 @@ class App(tk.Tk):
             "replace_player": self.v_replace_player.get(), "retry_temporary": self.v_retry.get(),
             "geo_server": self.v_geo_server.get(), "geo_loop": self.v_geo_loop.get(),
             "geo_picture": self.v_geo_picture.get(), "geo_ask": self.v_geo_ask.get(),
+            "black_screen": self.v_black.get(),
             "bidi_fix": self.v_bidi.get(), "confirm_exit": self.v_confirm_exit.get(),
             "encoding": self.v_encoding.get()})
         try:
