@@ -28,8 +28,14 @@ Run:   python playlist_checker_gui.py            (or double-click it on Windows)
 from __future__ import annotations
 
 import base64
+import copy
+import shlex
+import tempfile
+import hashlib
 import csv
+import gzip
 import http.client
+import io
 import json
 import locale
 import os
@@ -59,7 +65,7 @@ import tkinter.font as tkfont
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 APP_TITLE = "TV & Radio Playlist Checker"
-APP_VERSION = "1.3.3"
+APP_VERSION = "1.6.2"
 PROJECT_URL = "https://github.com/antoxa78/PyPlaylist-Checker"
 DEFAULT_UA = "VLC/3.0.20 LibVLC/3.0.20"
 # Settings -> User-Agent. Some IPTV providers only answer certain players/apps.
@@ -111,6 +117,14 @@ LEGACY_ENCODINGS = [("auto", "Auto-detect"), ("cp1255", "Hebrew (Windows-1255)")
                     ("cp1251", "Cyrillic (Windows-1251)"), ("cp1256", "Arabic (Windows-1256)"),
                     ("cp1252", "Western European (Windows-1252)")]
 PLAYLIST_EXT = (".m3u", ".m3u8", ".pls", ".xspf")
+PLAYLIST_EXT_ALL = PLAYLIST_EXT + tuple(ext + ".gz" for ext in PLAYLIST_EXT)
+
+
+def is_playlist_name(name: str) -> bool:
+    """A playlist file name, including gzip-compressed .m3u.gz / .m3u8.gz / .pls.gz / .xspf.gz."""
+    return name.lower().endswith(PLAYLIST_EXT_ALL)
+
+
 NO_GROUP = "(no group)"
 LAUNCHER_ID = "playlist-checker"
 # physical key codes of A, C, V, X: Ctrl+C/V/X/A must also work while a Hebrew or
@@ -119,21 +133,64 @@ KEYCODE_LETTERS = {"x11": {38: "a", 54: "c", 55: "v", 53: "x"},
                    "win32": {65: "a", 67: "c", 86: "v", 88: "x"}}
 TEXT_FIELD_CLASSES = ("Entry", "TEntry", "TCombobox", "Spinbox", "TSpinbox")
 STREAM_URL_RE = re.compile(r"^\s*(?:https?|rtmpe?|rtmps|rtmpt|rtsps?|mmsh?|mmst|udp|rtp|srt)://\S+", re.I)
+AUDIO_URL_RE = re.compile(r"\.(?:mp3|aac|ogg|oga|opus|flac|m4a|m4b|wav|wma)(?:$|[?|])", re.I)
 
 ONLINE, OFFLINE, UNCHECKED, CHECKING = "online", "offline", "unchecked", "checking"
-STATUS_TEXT = {ONLINE: "● Online", OFFLINE: "✖ Offline", UNCHECKED: "○ Not checked", CHECKING: "… Checking"}
-STATUS_RANK = {ONLINE: 0, UNCHECKED: 1, CHECKING: 1, OFFLINE: 2}
+BLOCKED = "blocked"   # answers, but "not available in your country" / placeholder video
+STATUS_TEXT = {ONLINE: "● Online", OFFLINE: "✖ Offline", UNCHECKED: "○ Not checked", CHECKING: "… Checking",
+               BLOCKED: "⛔ Geo-blocked"}
+STATUS_RANK = {ONLINE: 0, UNCHECKED: 1, CHECKING: 1, OFFLINE: 2, BLOCKED: 2}
+
+# ---- "not available in your country" detection
+# addresses a server redirects to, or takes the video from, when a channel is blocked
+GEO_URL_RE = re.compile(
+    r"geo[-_.]?(?:block\w*|restrict\w*|fenc\w*|lock\w*|error|denied|forbidden|filter\w*)|"
+    r"not[-_.]?available|unavailable|out[-_.]?of[-_.]?(?:region|country|area)|"
+    r"(?:region|country|territory)[-_.]?(?:block\w*|lock\w*|restrict\w*|error|denied)|"
+    r"blocked[-_.]?(?:region|country|content|video|stream)|access[-_.]?denied|no[-_.]?rights|"
+    r"zaglushk\w*|stub[-_.]?video", re.I)
+# text of an error page / 403 answer that means "blocked where you are"
+GEO_TEXT_RE = re.compile(
+    r"\bgeo|your (?:country|region|location|area|territory)|not available in|outside (?:of )?(?:the )?"
+    r"(?:country|region|us|uk|eu)|territor|region|country|"
+    r"недоступ|регион|стран[еыа]|территори|местоположени|регіон|країн|"
+    r"אינו זמין|לא זמין|מחוץ ל|בארצך|באזורך|במיקומך", re.I)
+# answers that mean "try again later", not "this channel is gone": a second try often works
+TEMP_ERROR_RE = re.compile(
+    r"timeout|timed out|HTTP (?:408|425|429|50[0234]|52[0-9])\b|closed the connection|connection reset|"
+    r"reset by peer|aborted|broken pipe|temporar|remote end closed|EOF occurred|incomplete read", re.I)
+RETRY_PAUSE = 3            # seconds to wait before the second try
+RETRY_THREADS = 8          # fewer at once, so a busy server gets a chance to answer
+LOOP_MAX_SECONDS = 600     # a "live" HLS stream that ends after <= 10 min is a looping placeholder
+PIC_W, PIC_H = 80, 45      # thumbnail taken from each video channel
+PIC_MAX_DIST = 6           # pictures whose fingerprints differ in <= 6 of 64 bits are "the same"
+PIC_MIN_SPREAD = 8.0       # (almost) plain black / one-color frames are not compared
+PIC_FRAMES = 3             # frames taken from one download: at 0 s, ~0.8 s and ~1.6 s
+PIC_FRAME_GAP = 0.8        # seconds between them
+PIC_MOVING = 0.006         # > 0.6 % of the picture changes between frames = moving, i.e. live TV
+PIC_COLOR_MAX = 20         # colour layouts differing by more than this (0-255 average) are not the same
+PIC_COLOR_GRID = 4         # colour layout: average colour of 4 x 4 areas
+STILL_CHECK_GAP = 8         # seconds between the two pictures of the still-banner test
+SAME_PICTURE_MIN = 3       # this many different channels with one picture = probably a banner
 
 TCP_PORTS = {"rtmp": 1935, "rtmpe": 1935, "rtmpt": 80, "rtmps": 443, "rtsp": 554, "rtsps": 322,
              "mms": 1755, "mmst": 1755, "mmsh": 80}
 NOT_CHECKABLE = {"udp", "rtp", "igmp", "srt", "acestream", "magnet", "p2p", "sop"}
 
-SHOW_OPTIONS = ["All", "Online", "Offline", "Not checked", "Duplicates",
-                "Problems (offline + duplicates)", "Good (online, unique)",
+SHOW_OPTIONS = ["All", "Online", "Offline", "Geo-blocked", "Not checked", "Duplicates",
+                "Problems (offline, blocked, duplicates)", "Good (online, unique)",
                 "Included (will be saved)", "Excluded (unticked)"]
 
 ATTR_RE = re.compile(r'([A-Za-z0-9_\-:.]+)\s*=\s*(?:"([^"]*)"|\'([^\']*)\'|([^\s"\',]+))')
 QUALITY_RE = re.compile(r"\b(?:uhd|fhd|hd|sd|hq|lq|4k|8k|hevc|h\.?26[45]|\d{3,4}p|\d{2}\s?fps|backup|orig(?:inal)?)\b", re.I)
+# words that name another version of the SAME channel (quality, subtitles, second source ...)
+VARIANT_RE = re.compile(
+    r"\b(?:subs?|subtitles?|cc|mobile|lite|low|high|multi|alt|mirror|reserve|backup\s*\d*|"
+    r"(?:source|src|feed|link|stream|server|option|var|alt|mirror)\s*\d+)\b"
+    r"|כתוביות|מתורגם|מקור\s*\d*|גיבוי|резерв\w*|источник\s*\d*|запасн\w*|субтитр\w*", re.I)
+VARIANT_ID_PART = re.compile(
+    r"hevc|h26[45]|avc|uhd|fhd|hd|sd|hq|lq|4k|8k|\d{3,4}[pi]|\d{2}fps|subs?|subtitles?|cc|mobile|lite|"
+    r"low|high|multi|orig(?:inal)?|(?:src|source|backup|alt|mirror|feed|link|stream|server|reserve)\d*")
 BAD_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
 
@@ -157,6 +214,15 @@ class Channel:
     latency: int | None = None
     dup_of: int | None = None
     dup_reason: str = ""
+    pic_hash: int | None = None   # fingerprint of one video frame (needs ffmpeg)
+    pic_spread: float = 0.0
+    pic_gray: float = 0.0
+    pic_motion: float | None = None   # share of the picture that moves (None: unknown)
+    pic_colors: list | None = None    # colour layout of the picture
+    seg_hash: str | None = None   # fingerprint of the first HLS video segment
+    pic_src: tuple | None = None  # (address ffmpeg used for the picture, is HLS)
+    pic_time: float = 0.0         # when the picture was taken (time.monotonic)
+    audio: bool = False           # the last check found audio, not video (no picture check)
 
     def http_options(self) -> tuple[str | None, str | None]:
         """User-Agent and Referer the playlist asks for, if any."""
@@ -174,9 +240,12 @@ class Channel:
     def export_url(self) -> str:
         """URL for saving; relative local paths become absolute so the new playlist works anywhere."""
         u = self.url
-        if is_local(u) and not os.path.isabs(u) and self.base_dir:
-            return os.path.normpath(os.path.join(self.base_dir, u))
-        return u
+        if not is_local(u):
+            return u
+        p = os.path.expanduser(u)            # ~/videos/a.ts -> /home/me/videos/a.ts
+        if not os.path.isabs(p) and self.base_dir:
+            return os.path.normpath(os.path.join(self.base_dir, p))
+        return p
 
 
 def is_local(url: str) -> bool:
@@ -202,8 +271,34 @@ def guess_legacy_encoding(data: bytes) -> str:
     return "cp1252"
 
 
+class DamagedFileError(ValueError):
+    """A compressed playlist that can't be unpacked (damaged or cut off)."""
+
+
+def unpack_bytes(data: bytes, max_bytes: int = 200 * 1024 * 1024) -> bytes:
+    """A gzip-compressed playlist (.m3u.gz, or sent compressed by a server) -> plain bytes.
+    Raises DamagedFileError when the compressed data is damaged or incomplete."""
+    if data[:2] == b"\x1f\x8b":
+        try:
+            with gzip.GzipFile(fileobj=io.BytesIO(data)) as gz:
+                return gz.read(max_bytes)
+        except (OSError, EOFError) as e:
+            raise DamagedFileError("not a readable playlist (the compressed .gz file is damaged "
+                                   "or incomplete)") from e
+    return data
+
+
+def has_unicode_bom(data: bytes) -> bool:
+    return data[:2] in (b"\xff\xfe", b"\xfe\xff") or data[:4] in (b"\x00\x00\xfe\xff", b"\xff\xfe\x00\x00")
+
+
 def decode_bytes(data: bytes, legacy: str = "auto") -> str:
     """UTF-8 first (the normal case); otherwise the chosen or detected Windows code page."""
+    data = unpack_bytes(data)
+    if data[:4] in (b"\x00\x00\xfe\xff", b"\xff\xfe\x00\x00"):
+        return data.decode("utf-32", "replace")
+    if data[:2] in (b"\xff\xfe", b"\xfe\xff"):          # "Unicode" files from Windows Notepad
+        return data.decode("utf-16", "replace")
     try:
         return data.decode("utf-8-sig")
     except UnicodeDecodeError:
@@ -248,12 +343,42 @@ def name_from_url(url: str) -> str:
     return stem or p.netloc or url
 
 
+URL_LINE_RE = re.compile(r"^[a-z][a-z0-9+.\-]*://\S", re.I)
+MEDIA_FILE_RE = re.compile(r"\.(?:m3u8?|pls|xspf|ts|m2ts|mts|mp4|m4v|m4a|mkv|webm|avi|mov|flv|mpe?g|mp3|aac|"
+                           r"ac3|ogg|oga|opus|flac|wav|wma|wmv)(?:[?#|].*)?$", re.I)
+HLS_TAG_RE = re.compile(r"(?m)^[ \t]*#EXT-X-(?:TARGETDURATION|STREAM-INF|MEDIA-SEQUENCE|VERSION|KEY|MAP)",
+                        re.I)
+HLS_TAG_BYTES_RE = re.compile(rb"(?m)^[ \t]*#EXT-X-(?:TARGETDURATION|STREAM-INF|MEDIA-SEQUENCE|VERSION|KEY|MAP)",
+                              re.I)
+# line breaks that start a new entry in a saved playlist (splitlines() knows more than \n)
+LINE_BREAK_RE = re.compile(r"[\r\n\v\f\x1c-\x1e\x85\u2028\u2029]+")
+
+
+def one_line(value) -> str:
+    """Text that must stay on one playlist line: a name, group, URL or attribute value."""
+    return LINE_BREAK_RE.sub(" ", str(value))
+
+
+def plausible_entry(line: str) -> bool:
+    """Could this playlist line be a stream address or a file path? (Not JSON, HTML or a message.)"""
+    if URL_LINE_RE.match(line):
+        return True
+    # not a player option (e.g. --sout=...) pretending to be a channel address
+    return not (line.startswith("-") or line[0] in "{[<" or any(ch in line for ch in '<>"'))
+
+
+def is_hls_text(text: str) -> bool:
+    """An HLS stream (one channel: its segments or quality variants), not a list of channels."""
+    head = text.lstrip("﻿ \t\r\n")
+    return head[:7].upper() == "#EXTM3U" and HLS_TAG_RE.search(head[:65536].upper()) is not None
+
+
 def parse_m3u(text: str, source: str, base_dir: str) -> tuple[dict, list[Channel]]:
     header: dict = {}
     channels: list[Channel] = []
     pending = None
     for raw in text.splitlines():
-        line = raw.strip()
+        line = raw.strip().lstrip("﻿")
         if not line:
             continue
         upper = line.upper()
@@ -262,9 +387,12 @@ def parse_m3u(text: str, source: str, base_dir: str) -> tuple[dict, list[Channel
                 header.setdefault(k, v)
             continue
         if line.startswith("#"):
+            if upper.startswith("#EXTINF") and pending is not None and pending.get("inf"):
+                pending = None            # the previous #EXTINF had no address: don't inherit from it
             if pending is None:
                 pending = {"name": "", "duration": "-1", "attrs": {}, "group": "", "extra": []}
             if upper.startswith("#EXTINF"):
+                pending["inf"] = True
                 head, name = split_extinf(line.partition(":")[2])
                 m = re.match(r"\s*(-?\d+(?:\.\d+)?)", head)
                 pending["duration"] = m.group(1) if m else "-1"
@@ -277,6 +405,9 @@ def parse_m3u(text: str, source: str, base_dir: str) -> tuple[dict, list[Channel
                     pending["group"] = line[8:].strip()
             elif upper.startswith(("#EXTVLCOPT", "#KODIPROP", "#EXTHTTP")):
                 pending["extra"].append(line)
+            continue
+        if not plausible_entry(line):
+            pending = None                # e.g. a JSON / HTML error message, not an address
             continue
         p = pending or {"name": "", "duration": "-1", "attrs": {}, "group": "", "extra": []}
         channels.append(Channel(name=p["name"] or name_from_url(line), url=line, group=p["group"],
@@ -309,7 +440,7 @@ def parse_xspf(text: str, source: str, base_dir: str) -> list[Channel]:
     for el in root.iter():
         if local(el.tag) != "track":
             continue
-        info = {local(c.tag): (c.text or "").strip() for c in el}
+        info = {local(c.tag): one_line((c.text or "").strip()) for c in el}
         loc = info.get("location")
         if not loc:
             continue
@@ -396,7 +527,16 @@ def bidi_visual(text: str) -> str:
         levels = [0 if c == "L" else 1 if c == "R" else 2 for c in cls]
     else:
         levels = [1 if c == "R" else 2 for c in cls]
-    chars = [ch.translate(MIRROR) if lv % 2 else ch for ch, lv in zip(text, levels)]
+    # a letter and the combining marks after it (Hebrew niqqud, Arabic harakat) move as one unit,
+    # so the marks stay after their letter, where a left-to-right renderer expects them
+    units, unit_levels = [], []
+    for ch, t, lv in zip(text, types, levels):
+        if t == "NSM" and units:
+            units[-1] += ch
+        else:
+            units.append(ch.translate(MIRROR) if lv % 2 else ch)
+            unit_levels.append(lv)
+    levels, n = unit_levels, len(units)
     for lvl in range(max(levels), 0, -1):
         i = 0
         while i < n:
@@ -404,12 +544,12 @@ def bidi_visual(text: str) -> str:
                 j = i
                 while j < n and levels[j] >= lvl:
                     j += 1
-                chars[i:j] = chars[i:j][::-1]
+                units[i:j] = units[i:j][::-1]
                 levels[i:j] = levels[i:j][::-1]
                 i = j
             else:
                 i += 1
-    return "".join(chars)
+    return "".join(units)
 
 
 def vis(text) -> str:
@@ -448,7 +588,90 @@ def split_url_headers(url: str) -> tuple[str, dict]:
     return base, headers
 
 
+def header_value(headers: dict, name: str) -> str | None:
+    """Case-insensitive value of one header (playlist url|Header=value style)."""
+    want = name.lower()
+    return next((v for k, v in headers.items() if k.lower() == want), None)
+
+
+def split_userinfo(url: str) -> tuple[str, str | None]:
+    """'http://user:pass@host/x' -> ('http://host/x', 'Basic …'). Python's HTTP client would take
+    'user:pass@host' for the server name, so the login goes into an Authorization header instead."""
+    try:
+        p = urllib.parse.urlsplit(url)
+    except ValueError:
+        return url, None
+    if p.scheme.lower() not in ("http", "https") or "@" not in p.netloc:
+        return url, None
+    userinfo, _, hostport = p.netloc.rpartition("@")
+    user, _, password = userinfo.partition(":")
+    token = base64.b64encode(f"{urllib.parse.unquote(user)}:{urllib.parse.unquote(password)}"
+                             .encode("utf-8")).decode("ascii")
+    return urllib.parse.urlunsplit((p.scheme, hostport, p.path, p.query, p.fragment)), f"Basic {token}"
+
+
+def effective_port(p) -> int | None:
+    port = p.port
+    return port if port is not None else {"http": 80, "https": 443}.get((p.scheme or "").lower())
+
+
+def same_host(a: str, b: str) -> bool:
+    try:
+        pa, pb = urllib.parse.urlsplit(a), urllib.parse.urlsplit(b)
+        return ((pa.hostname or "").lower() == (pb.hostname or "").lower()
+                and effective_port(pa) == effective_port(pb))
+    except ValueError:
+        return False
+
+
+def can_share_login(from_url: str, to_url: str) -> bool:
+    """May the login of from_url be used for to_url? Same server, or an http -> https
+    upgrade (the login stays on the same host and is sent encrypted), never a downgrade."""
+    try:
+        src, dst = urllib.parse.urlsplit(from_url), urllib.parse.urlsplit(to_url)
+    except ValueError:
+        return False
+    if (src.hostname or "").lower() != (dst.hostname or "").lower():
+        return False
+    src_scheme, dst_scheme = (src.scheme or "").lower(), (dst.scheme or "").lower()
+    if src_scheme == "https" and dst_scheme != "https":
+        return False
+    if same_host(from_url, to_url):
+        return True
+    return src_scheme == "http" and dst_scheme == "https"
+
+
+def with_login(url: str, login_url: str | None) -> str:
+    """Put the user:pass@ of login_url back into url (same server / a secure upgrade) - for ffmpeg."""
+    if not login_url or not can_share_login(login_url, url):
+        return url
+    try:
+        userinfo = urllib.parse.urlsplit(login_url).netloc.rpartition("@")[0]
+        p = urllib.parse.urlsplit(url)
+    except ValueError:
+        return url
+    if not userinfo or "@" in p.netloc:
+        return url
+    return urllib.parse.urlunsplit((p.scheme, f"{userinfo}@{p.netloc}", p.path, p.query, p.fragment))
+
+
+class AuthSafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Follow redirects, but don't send the login (user:pass@) on to another server."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        new = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new is not None and not can_share_login(req.full_url, new.full_url):
+            new.remove_header("Authorization")
+        return new
+
+
+def build_opener(ctx: ssl.SSLContext):
+    return urllib.request.build_opener(urllib.request.HTTPSHandler(context=ctx), AuthSafeRedirectHandler())
+
+
 def short_error(err) -> str:
+    if isinstance(err, urllib.error.HTTPError):
+        return f"HTTP {err.code} {err.reason or ''}".strip()
     text = str(getattr(err, "reason", err) or err.__class__.__name__)
     text = re.sub(r"^\[Errno -?\d+\]\s*", "", text)
     text = re.sub(r"^<urlopen error (.*)>$", r"\1", text)
@@ -462,21 +685,56 @@ def short_error(err) -> str:
     return text[:80]
 
 
-def read_some(resp, limit: int, deadline: float) -> bytes:
+HLS_MAX_BYTES = 16 * 1024 * 1024   # biggest HLS playlist read when checking
+HLS_VARIANT_TRIES = 3              # quality variants of a master playlist tried before "offline"
+
+
+def read_upto(resp, limit: int, deadline: float) -> tuple[bytes, bool]:
     """Read up to `limit` bytes, but stop at `deadline` - a server that sends data
-    very slowly can't hold one channel's check for minutes."""
-    buf = b""
+    very slowly can't hold one channel's check for minutes.
+    Returns (data, complete): complete is True when the whole answer was read."""
+    parts, size, complete = [], 0, False
     read = getattr(resp, "read1", resp.read)
     try:
-        while len(buf) < limit and time.monotonic() < deadline:
-            chunk = read(min(65536, limit - len(buf)))
+        while size < limit and time.monotonic() < deadline:
+            chunk = read(min(65536, limit - size))
             if not chunk:
+                complete = True
                 break
-            buf += chunk
+            parts.append(chunk)
+            size += len(chunk)
     except (socket.timeout, TimeoutError, OSError, http.client.HTTPException):
-        if not buf:
+        if not parts:
             raise
-    return buf
+    return b"".join(parts), complete
+
+
+def read_some(resp, limit: int, deadline: float) -> bytes:
+    return read_upto(resp, limit, deadline)[0]
+
+
+def hls_variants(text: str) -> list[tuple[str, bool]]:
+    """Quality variants of an HLS master playlist as (address, has video): video variants from the
+    LOWEST bandwidth up (small segments, fast), then audio-only variants."""
+    out = []
+    lines = [ln.strip() for ln in text.splitlines()]
+    for i, ln in enumerate(lines):
+        if not ln.upper().startswith("#EXT-X-STREAM-INF"):
+            continue
+        uri = next((x for x in lines[i + 1:] if x and not x.startswith("#")), None)
+        if not uri:
+            continue
+        codecs = (re.search(r'CODECS="([^"]*)"', ln, re.I) or [None, ""])[1].lower()
+        video = not codecs or re.search(r"avc|hvc|hev|vp0?9|av01|mp4v", codecs) is not None
+        m = re.search(r"(?<![-A-Z])BANDWIDTH=(\d+)", ln, re.I)
+        bw = int(m.group(1)) if m else 10 ** 12
+        out.append((not video, bw, len(out), uri, video))
+    seen, result = set(), []
+    for *_, uri, video in sorted(out):
+        if uri not in seen:
+            seen.add(uri)
+            result.append((uri, video))
+    return result
 
 
 # ---------------------------------------------------------------- playlist downloads / URL lists
@@ -511,7 +769,7 @@ def parse_url_list(text: str, base_dir: Path) -> tuple[list[str], list[str], lis
         p = Path(os.path.expanduser(line))
         if not p.is_absolute():
             p = base_dir / p
-        if p.suffix.lower() in PLAYLIST_EXT and p.is_file() and str(p) not in seen:
+        if is_playlist_name(p.name) and p.is_file() and str(p) not in seen:
             seen.add(str(p))
             local.append(p)
     return web, streams, local
@@ -523,7 +781,7 @@ def classify_download(head: bytes, ctype: str) -> str:
     low = h[:300].lower()
     if h.startswith(b"#EXTM3U") or h.startswith(b"#EXTINF"):
         # an HLS stream (one channel) also starts with #EXTM3U, but uses #EXT-X- tags
-        if re.search(rb"#EXT-X-(TARGETDURATION|STREAM-INF|MEDIA-SEQUENCE|VERSION|KEY|MAP)", head):
+        if HLS_TAG_BYTES_RE.search(head):
             return "stream"
         return "playlist"
     if low.startswith(b"[playlist]") or low.startswith(b"<playlist") or (low.startswith(b"<?xml") and b"<playlist" in low):
@@ -534,47 +792,285 @@ def classify_download(head: bytes, ctype: str) -> str:
         return "stream"
     if b"\x00" in head:
         return "stream"  # binary data: a stream, not a text playlist
-    return "playlist"    # plain text, e.g. a simple list of stream links
+    # plain text: a simple list of stream links is a playlist; anything else (a JSON or text error
+    # message such as {"status":"error"} or "Access denied") is not
+    if looks_like_link_list(head.decode("utf-8", "ignore")):
+        return "playlist"
+    return "page"
+
+
+def looks_like_link_list(text: str) -> bool:
+    """Plain text with stream addresses / media files, one per line (most of its lines)."""
+    lines = [ln.strip() for ln in text.lstrip("﻿").splitlines()]
+    lines = [ln for ln in lines if ln and not ln.startswith("#")]
+    if not lines:
+        return False
+    good = sum(1 for ln in lines if URL_LINE_RE.match(ln) or
+               (plausible_entry(ln) and MEDIA_FILE_RE.search(ln)))
+    return good > 0 and good * 2 >= len(lines)
+
+
+def answer_snippet(data: bytes, ctype: str) -> str:
+    """Start of a non-playlist answer for the error message (JSON / text error messages)."""
+    if ctype.startswith("text/html") or data.lstrip()[:20].lower().startswith((b"<!doctype", b"<html")):
+        return ""
+    text = data.decode("utf-8", "ignore").lstrip("﻿").strip()
+    if not text or any(ord(ch) < 32 and ch not in "\r\n\t" for ch in text[:200]):
+        return ""
+    text = " ".join(text.split())
+    return text[:160] + ("…" if len(text) > 160 else "")
 
 
 def fetch_playlist(url: str, ua: str, ignore_ssl: bool, legacy: str, timeout: float = 40,
-                   max_seconds: float = 300, max_bytes: int = 100 * 1024 * 1024) -> tuple[str, str]:
-    """Download a playlist. Returns (kind, text): kind 'playlist' with its text, 'stream' or 'page'.
-    A live stream is recognised from its first bytes and not downloaded."""
+                   max_seconds: float = 300, max_bytes: int = 100 * 1024 * 1024) -> tuple[str, str, str]:
+    """Download a playlist. Returns (kind, text, base): kind 'playlist' with its text, 'stream' or
+    'page' (text: the start of the server's answer, if it is readable text). base is the address
+    the playlist really came from after a redirect ("" when not redirected) - its relative links
+    are relative to that address. A live stream is recognised from its first bytes and not downloaded."""
     ctx = ssl.create_default_context()
     if ignore_ssl:
         ctx.check_hostname, ctx.verify_mode = False, ssl.CERT_NONE
-    opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=ctx))
-    req = urllib.request.Request(url, headers={"User-Agent": ua or DEFAULT_UA, "Accept": "*/*"})
+    opener = build_opener(ctx)
+    plain, extra_headers = split_url_headers(url.strip())     # Kodi style 'url|User-Agent=…'
+    plain, auth = split_userinfo(plain)
+    headers = {"User-Agent": ua or DEFAULT_UA, "Accept": "*/*"}
+    if auth:
+        headers["Authorization"] = auth
+    headers.update(extra_headers)
+    sent = request_url(plain)
+    req = urllib.request.Request(sent, headers=headers)
     with opener.open(req, timeout=timeout) as r:
         ctype = (r.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        final = r.geturl()
+        base = final if final != sent else ""
         start = time.monotonic()
         head = read_some(r, 4096, start + timeout)
-        kind = classify_download(head, ctype)
+        compressed = head[:2] == b"\x1f\x8b"
+        if compressed:                                   # .m3u.gz / server sent it compressed
+            data = unpack_bytes(head + read_some(r, max_bytes, start + max_seconds))
+            head = data[:4096]
+        if has_unicode_bom(head):
+            kind = "playlist"
+        else:
+            kind = classify_download(head, "" if compressed else ctype)
+        if kind == "page":
+            return kind, answer_snippet(head, ctype), base
         if kind != "playlist":
-            return kind, ""
-        data = head + read_some(r, max_bytes, start + max_seconds)
-    return "playlist", decode_bytes(data, legacy)
+            return kind, "", base
+        if not compressed:
+            data = head + read_some(r, max_bytes, start + max_seconds)
+    return "playlist", decode_bytes(data, legacy), base
+
+
+def request_url(url: str) -> str:
+    """Address as a web request needs it: spaces and non-Latin letters encoded (players accept
+    them raw, Python's HTTP client does not). Already encoded parts (%20) are kept."""
+    if all(33 <= ord(ch) < 127 for ch in url):
+        return url
+    try:
+        p = urllib.parse.urlsplit(url.strip())
+        netloc = p.netloc
+        if p.hostname and not p.hostname.isascii():
+            host = p.hostname.encode("idna").decode("ascii")
+            userinfo = netloc.rpartition("@")[0]
+            netloc = (userinfo + "@" if userinfo else "") + host + (f":{p.port}" if p.port else "")
+        path = urllib.parse.quote(p.path, safe="/%:@!$&'()*+,;=~")
+        query = urllib.parse.quote(p.query, safe="=&%:/?@!$'()*+,;~")
+        return urllib.parse.urlunsplit((p.scheme, netloc, path, query, p.fragment))
+    except (ValueError, UnicodeError):
+        return url
+
+
+def find_ffmpeg() -> str | None:
+    cands = [shutil.which("ffmpeg")]
+    if sys.platform.startswith("win"):
+        for base in (os.environ.get("ProgramFiles", r"C:\Program Files"), r"C:\ffmpeg"):
+            cands += [os.path.join(base, "ffmpeg", "bin", "ffmpeg.exe"), os.path.join(base, "bin", "ffmpeg.exe")]
+    return next((c for c in cands if c and os.path.isfile(c)), None)
+
+
+def hamming(a: int, b: int) -> int:
+    x = a ^ b
+    return x.bit_count() if hasattr(x, "bit_count") else bin(x).count("1")
+
+
+def pic_close(h1: int, g1: float, h2: int, g2: float, c1=None, c2=None) -> bool:
+    """Same picture: same shape (fingerprint), same brightness and - when both are known -
+    the same colours (a navy/white banner is not the same as a green/pink slate with the same layout)."""
+    if hamming(h1, h2) > PIC_MAX_DIST or abs(g1 - g2) > 25:
+        return False
+    if c1 and c2 and len(c1) == len(c2):
+        return sum(abs(a - b) for a, b in zip(c1, c2)) / len(c1) <= PIC_COLOR_MAX
+    return True
+
+
+def picture_extras(pic) -> tuple:
+    """(motion, colour layout) of a grab_picture() result."""
+    return (pic[4], pic[5]) if len(pic) >= 6 else (None, None)
+
+
+def is_moving(c) -> bool:
+    return c.pic_motion is not None and c.pic_motion > PIC_MOVING
+
+
+def parse_ppms(data: bytes) -> list:
+    """All frames ffmpeg wrote one after another: [(w, h, pixels, raw PPM bytes), ...]."""
+    frames, pos = [], 0
+    while True:
+        m = PPM_HEADER_RE.match(data or b"", pos)
+        if not m:
+            return frames
+        w, h = int(m.group(1)), int(m.group(2))
+        end = m.end() + w * h * 3
+        if end > len(data):
+            return frames
+        frames.append((w, h, data[m.end():end], data[pos:end]))
+        pos = end
+
+
+PPM_HEADER_RE = re.compile(rb"P6\s+(\d+)\s+(\d+)\s+(\d+)\s")
+
+
+def gray_pixels(px: bytes) -> list:
+    return [(px[i] * 299 + px[i + 1] * 587 + px[i + 2] * 114) // 1000 for i in range(0, len(px), 3)]
+
+
+def frame_motion(a: bytes, b: bytes) -> float:
+    """Share of the picture whose brightness changed noticeably between two frames."""
+    ga, gb = gray_pixels(a), gray_pixels(b)
+    return sum(1 for x, y in zip(ga, gb) if abs(x - y) > 12) / max(len(ga), 1)
+
+
+def color_layout(w: int, h: int, px: bytes, n: int = PIC_COLOR_GRID) -> list:
+    """Average colour of n x n areas of the frame (R, G, B each)."""
+    sig = []
+    for gy in range(n):
+        for gx in range(n):
+            r = g = b = cnt = 0
+            for y in range(gy * h // n, max((gy + 1) * h // n, gy * h // n + 1)):
+                base = y * w
+                for x in range(gx * w // n, max((gx + 1) * w // n, gx * w // n + 1)):
+                    i = (base + x) * 3
+                    r += px[i]; g += px[i + 1]; b += px[i + 2]; cnt += 1
+            sig += [r // cnt, g // cnt, b // cnt]
+    return sig
+
+
+_FFMPEG_FPS_ARGS: dict = {}
+
+
+def ffmpeg_passthrough_args(ffmpeg: str) -> list:
+    """Option that stops ffmpeg from repeating frames (otherwise every picture looks 'still'):
+    -fps_mode passthrough since ffmpeg 5.1, -vsync 0 before."""
+    if ffmpeg not in _FFMPEG_FPS_ARGS:
+        args = ["-fps_mode", "passthrough"]
+        try:
+            out = subprocess.run([ffmpeg, "-hide_banner", "-version"], capture_output=True, timeout=10).stdout
+            m = re.search(rb"version\s+n?(\d+)\.(\d+)", out)
+            if m and (int(m.group(1)), int(m.group(2))) < (5, 1):
+                args = ["-vsync", "0"]
+        except (OSError, subprocess.SubprocessError):
+            pass
+        _FFMPEG_FPS_ARGS[ffmpeg] = args
+    return _FFMPEG_FPS_ARGS[ffmpeg]
+
+
+def parse_ppm(data: bytes):
+    m = re.match(rb"P6\s+(\d+)\s+(\d+)\s+(\d+)\s", data or b"")
+    if not m:
+        return None
+    w, h = int(m.group(1)), int(m.group(2))
+    px = data[m.end(): m.end() + w * h * 3]
+    return (w, h, px) if len(px) == w * h * 3 else None
+
+
+def picture_fingerprint(w: int, h: int, px: bytes) -> tuple[int, float, float]:
+    """64-bit difference hash of a frame (robust to re-encoding and size), its contrast and brightness."""
+    gray = [(px[i] * 299 + px[i + 1] * 587 + px[i + 2] * 114) // 1000 for i in range(0, len(px), 3)]
+    mean = sum(gray) / len(gray)
+    spread = (sum((v - mean) ** 2 for v in gray) / len(gray)) ** 0.5
+    cells = []
+    for gy in range(8):
+        y0, y1 = gy * h // 8, max((gy + 1) * h // 8, gy * h // 8 + 1)
+        row = []
+        for gx in range(9):
+            x0, x1 = gx * w // 9, max((gx + 1) * w // 9, gx * w // 9 + 1)
+            tot = cnt = 0
+            for y in range(y0, y1):
+                base = y * w
+                for x in range(x0, x1):
+                    tot += gray[base + x]
+                    cnt += 1
+            row.append(tot / cnt)
+        cells.append(row)
+    bits = 0
+    for row in cells:
+        for x in range(8):
+            bits = (bits << 1) | (1 if row[x] > row[x + 1] else 0)
+    return bits, spread, mean
 
 
 class StreamChecker:
-    def __init__(self, timeout: float, user_agent: str, deep_hls: bool, ignore_ssl: bool):
+    def __init__(self, timeout: float, user_agent: str, deep_hls: bool, ignore_ssl: bool,
+                 geo_server: bool = True, geo_loop: bool = True, ffmpeg: str | None = None):
         self.timeout = timeout
         self.ua = user_agent or DEFAULT_UA
         self.deep = deep_hls
+        self.geo_server = geo_server
+        self.geo_loop = geo_loop
+        self.ffmpeg = ffmpeg
+        self._procs: set = set()
+        self._procs_lock = threading.Lock()
         self.ctx = ssl.create_default_context()
         if ignore_ssl:
             self.ctx.check_hostname = False
             self.ctx.verify_mode = ssl.CERT_NONE
 
-    def check(self, url: str, base_dir: str = "", ua: str | None = None, referer: str | None = None):
-        """Returns (status, info, milliseconds)."""
+    def check_full(self, url: str, base_dir: str = "", ua: str | None = None, referer: str | None = None):
+        """Returns (status, info, milliseconds, extra) - extra: seg_hash, audio, ..."""
         t0 = time.monotonic()
+        self._extra = extra = {}
         try:
             status, info = self._check(url.strip(), base_dir, ua, referer)
         except Exception as e:  # never let one channel stop the whole check
             status, info = OFFLINE, f"error: {short_error(e)}"
-        return status, info, int((time.monotonic() - t0) * 1000)
+        finally:
+            self._extra = None
+        if status == ONLINE and self.geo_loop and extra.get("vod_seconds") is not None:
+            secs = extra["vod_seconds"]
+            if secs <= LOOP_MAX_SECONDS:
+                status, info = BLOCKED, (f"not live: a {secs:.0f} s video plays instead of the channel "
+                                         "(usually a 'not available' banner)")
+        return status, info, int((time.monotonic() - t0) * 1000), extra
+
+    # each worker thread has its own "extra" dict
+    _tls = threading.local()
+
+    @property
+    def _extra(self):
+        return getattr(self._tls, "extra", None)
+
+    @_extra.setter
+    def _extra(self, value):
+        self._tls.extra = value
+
+    def _note(self, **kw):
+        if self._extra is not None:
+            self._extra.update(kw)
+
+    def _note_picture_source(self, text: str, url: str):
+        """Which address ffmpeg should open for the picture: the LOWEST video quality of a master
+        playlist (small segments, fast) - the fingerprint does not depend on the resolution."""
+        if self._extra is None or "pic_url" in self._extra:
+            return
+        if "#EXT-X-STREAM-INF" not in text:
+            pic = url                                     # already a single-quality playlist
+        else:
+            variants = hls_variants(text)
+            if not (variants and variants[0][1]):
+                return
+            pic = urllib.parse.urljoin(url, variants[0][0])
+        self._note(pic_url=with_login(pic, self._extra.get("login_url")), pic_hls=True)
 
     def _check(self, url, base_dir, ua, referer):
         if is_local(url):
@@ -588,8 +1084,12 @@ class StreamChecker:
             headers = {"User-Agent": ua or self.ua, "Accept": "*/*", "Icy-MetaData": "1"}
             if referer:
                 headers["Referer"] = referer
+            plain, auth = split_userinfo(url)
+            if auth:                           # http://user:pass@host/… -> Authorization header
+                headers["Authorization"] = auth
+                self._note(login_url=url)      # ffmpeg (picture) understands user:pass@ itself
             headers.update(extra_headers)
-            return self._http(url, headers, 0)
+            return self._http(plain, headers, 0)
         if scheme in TCP_PORTS:
             return self._tcp(p, scheme)
         if scheme in NOT_CHECKABLE:
@@ -615,7 +1115,8 @@ class StreamChecker:
             return OFFLINE, short_error(e)
 
     def _http(self, url, headers, depth):
-        opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=self.ctx))
+        opener = build_opener(self.ctx)
+        url = request_url(url)
         req = urllib.request.Request(url, headers=headers)
         try:
             with opener.open(req, timeout=self.timeout) as r:
@@ -624,14 +1125,35 @@ class StreamChecker:
                 final_url = r.geturl()
                 deadline = time.monotonic() + self.timeout
                 data = read_some(r, 2048, deadline)
-                is_hls = data.lstrip(b"\xef\xbb\xbf \t\r\n").startswith(b"#EXTM3U")
+                head = data.lstrip(b"\xef\xbb\xbf \t\r\n")
+                is_hls = (head.startswith(b"#EXTM3U")
+                          and HLS_TAG_BYTES_RE.search(head) is not None)
+                complete = True
                 if is_hls:
-                    data += read_some(r, 1024 * 1024, deadline)  # rest of the HLS playlist
+                    # rest of the HLS playlist - channels with a long rewind window (24 h of
+                    # 6-second segments) have playlists of 1-2 MB
+                    rest, complete = read_upto(r, HLS_MAX_BYTES, deadline)
+                    data += rest
+                elif depth > 0:
+                    data += read_some(r, 65536 - len(data), deadline)  # video segment: fingerprint
+                elif ctype.startswith("text/html"):
+                    data += read_some(r, 65536 - len(data), deadline)  # error page: look for "your country"
         except urllib.error.HTTPError as e:
+            if self.geo_server:
+                if e.code == 451:
+                    return BLOCKED, "HTTP 451 – blocked in this country"
+                if e.code in (401, 403):
+                    try:
+                        body = e.read(8192).decode("utf-8", "ignore")
+                    except Exception:
+                        body = ""
+                    if GEO_TEXT_RE.search(body) or GEO_TEXT_RE.search(str(e.reason or "")):
+                        return BLOCKED, f"HTTP {e.code} – not available in this country / region"
             return OFFLINE, f"HTTP {e.code} {e.reason}".strip()
         except http.client.BadStatusLine as e:
             line = str(getattr(e, "line", e)).strip()
             if line.upper().startswith("ICY 200"):
+                self._note(audio=True)
                 return ONLINE, "ICY 200 (Shoutcast radio)"
             if isinstance(e, http.client.RemoteDisconnected):
                 return OFFLINE, "server closed the connection"
@@ -647,16 +1169,46 @@ class StreamChecker:
         except (OSError, http.client.HTTPException) as e:
             return OFFLINE, short_error(e)
 
+        if self.geo_server and (GEO_URL_RE.search(final_url if depth == 0 else url) or
+                                (final_url != url and GEO_URL_RE.search(final_url))):
+            if depth == 0 and final_url != url:
+                return BLOCKED, "redirected to a 'not available' address"
+            if depth > 0:
+                return BLOCKED, "the video comes from a 'not available' address"
+
         if is_hls:
-            text = data.decode("utf-8", "ignore")
+            if not complete:
+                # only part of a huge playlist arrived: its last line may be cut in the middle,
+                # and a cut segment name gives a false "HTTP 404" - use complete lines only
+                data = data[:data.rfind(b"\n") + 1]
+            text = data.decode("utf-8", "ignore").lstrip("﻿ \t\r\n")
             uris = [ln.strip() for ln in text.splitlines() if ln.strip() and not ln.strip().startswith("#")]
+            if "#EXT-X-STREAM-INF" not in text and ("#EXT-X-ENDLIST" in text or "PLAYLIST-TYPE:VOD" in text):
+                durations = re.findall(r"#EXTINF:\s*([\d.]+)", text)
+                self._note(vod_seconds=sum(float(d) for d in durations if d.replace(".", "", 1).isdigit()))
             if not uris:
                 return OFFLINE, f"HTTP {code} · HLS playlist is empty"
+            self._note_picture_source(text, final_url)
+            variants = hls_variants(text) if "#EXT-X-STREAM-INF" in text else []
+            if variants and all(not video for _, video in variants):
+                self._note(audio=True)          # an HLS radio playlist: no video to fingerprint
+            elif not variants and all(AUDIO_URL_RE.search(u) for u in uris):
+                self._note(audio=True)
             if not self.deep or depth >= 3:
                 return ONLINE, f"HTTP {code} · HLS playlist"
-            # master playlist -> first quality variant; media playlist -> newest segment
-            nxt = uris[0] if "#EXT-X-STREAM-INF" in text else uris[-1]
-            status, info = self._http(urllib.parse.urljoin(final_url, nxt), headers, depth + 1)
+            # master playlist -> quality variants (lowest first) until one works;
+            # media playlist -> newest segment
+            if variants:
+                tries = [u for u, _ in variants][:HLS_VARIANT_TRIES] or uris[:1]
+            else:
+                tries = uris[-1:]
+            for nxt in tries:
+                nxt_url = urllib.parse.urljoin(final_url, nxt)
+                sub = headers if can_share_login(url, nxt_url) else \
+                    {k: v for k, v in headers.items() if k.lower() != "authorization"}
+                status, info = self._http(nxt_url, sub, depth + 1)
+                if status != OFFLINE:
+                    break
             if info.startswith("HLS"):
                 return status, info
             return status, ("HLS · " if status == ONLINE else "HLS segment: ") + info
@@ -664,8 +1216,153 @@ class StreamChecker:
         if not data:
             return OFFLINE, f"HTTP {code} · empty answer"
         if ctype.startswith("text/html") or data.lstrip()[:20].lower().startswith((b"<!doctype html", b"<html")):
+            if self.geo_server and GEO_TEXT_RE.search(data.decode("utf-8", "ignore")):
+                return BLOCKED, f"HTTP {code} · page says 'not available in your country / region'"
             return OFFLINE, f"HTTP {code} · web page, not a stream"
+        # HTTP 200 does not have to be a stream: panels often answer with a JSON or
+        # text error, and a channel address can point to a normal playlist.
+        kind = classify_download(data[:4096], ctype)
+        textual = (ctype.startswith(("text/", "application/json", "application/xml"))
+                   or "mpegurl" in ctype or ctype in ("audio/x-scpls", "application/xspf+xml")
+                   or data.lstrip()[:1] in (b"{", b"[", b"<"))
+        if not textual and not ctype:      # no content type: trust readable text only
+            try:
+                data[:2048].decode("utf-8")
+                textual = True
+            except UnicodeDecodeError:
+                pass
+        if kind == "page" and textual and ctype != "text/vtt":
+            if self.geo_server and GEO_TEXT_RE.search(data.decode("utf-8", "ignore")):
+                return BLOCKED, f"HTTP {code} · message says 'not available in your country / region'"
+            snippet = answer_snippet(data, ctype)
+            return OFFLINE, f"HTTP {code} · " + (
+                f"not a stream: {snippet}" if snippet else "web page, not a stream")
+        if kind == "playlist":
+            return ONLINE, f"HTTP {code} · playlist (not a single stream)"
+        if depth > 0:
+            self._note(seg_hash=hashlib.sha1(data[:65536]).hexdigest())
+        if ctype.startswith("audio/") or ctype in ("application/ogg",):
+            self._note(audio=True)
         return ONLINE, f"HTTP {code}" + (f" · {ctype}" if ctype else "")
+
+    # ------------------------------------------------------------------ picture (ffmpeg)
+    def grab_picture(self, url: str, ua: str | None = None, referer: str | None = None, hls: bool = False):
+        """Up to 3 frames, ~0.8 s apart, from ONE download of the stream ->
+        (fingerprint, contrast, brightness, PPM thumbnail, motion, colour layout) or None (no picture).
+        The fingerprint comes from the first frame that is not plain black (fade-in), motion is how
+        much of the picture changes between the frames (None when only one frame came)."""
+        if not self.ffmpeg:
+            return None
+        url, extra_headers = split_url_headers(url.strip())
+        url = request_url(url)
+        ua = extra_headers.pop("User-Agent", None) or ua or self.ua
+        referer = extra_headers.pop("Referer", None) or referer
+        cmd = [self.ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin",
+               "-analyzeduration", "2000000", "-probesize", "1500000"]
+        if url.lower().startswith(("http://", "https://")):
+            cmd += ["-rw_timeout", str(int(self.timeout * 1_000_000)), "-user_agent", ua]
+            hdrs = ([("Referer", referer)] if referer else []) + list(extra_headers.items())
+            if hdrs:
+                cmd += ["-headers", "".join(f"{k}: {v}\r\n" for k, v in hdrs)]
+        if hls:
+            cmd += ["-live_start_index", "-1"]   # only the newest segment
+        cmd += ["-threads", "1", "-i", url, "-map", "0:v:0",
+                "-vf", f"select='eq(n\\,0)+gte(t-prev_selected_t\\,{PIC_FRAME_GAP})',scale={PIC_W}:{PIC_H}"]
+        tail = ["-frames:v", str(PIC_FRAMES), "-f", "image2pipe", "-vcodec", "ppm", "-"]
+        prints: list = []
+
+        def enough(frames) -> bool:
+            """Stop downloading as soon as the answer is clear: live TV (moving picture) after the
+            2nd frame; only still pictures (cheap - they compress to almost nothing) need all 3."""
+            while len(prints) < len(frames):
+                w, h, px, _ = frames[len(prints)]
+                prints.append(picture_fingerprint(w, h, px))
+            usable = [f[2] for f, fp in zip(frames, prints) if fp[1] >= PIC_MIN_SPREAD]
+            return len(frames) >= PIC_FRAMES or (len(usable) >= 2 and frame_motion(usable[-2], usable[-1]) > PIC_MOVING)
+
+        fps_args = ffmpeg_passthrough_args(self.ffmpeg)
+        frames, err = self._read_frames(cmd + fps_args + tail, enough)
+        if not frames and re.search(rb"Unrecognized option|Option not found|not supported", err or b""):
+            fps_args = ["-vsync", "0"] if fps_args[0] == "-fps_mode" else ["-fps_mode", "passthrough"]
+            _FFMPEG_FPS_ARGS[self.ffmpeg] = fps_args
+            prints.clear()
+            frames, err = self._read_frames(cmd + fps_args + tail, enough)
+        if not frames:
+            return None
+        enough(frames)
+        best = next((i for i, fp in enumerate(prints) if fp[1] >= PIC_MIN_SPREAD), 0)
+        bits, spread, mean = prints[best]
+        w, h, px, raw = frames[best]
+        # motion between the usable frames (a black fade-in frame does not count as movement)
+        usable = [f[2] for f, fp in zip(frames, prints) if fp[1] >= PIC_MIN_SPREAD] or [f[2] for f in frames]
+        motion = max((frame_motion(a, b) for a, b in zip(usable, usable[1:])), default=None)
+        return bits, spread, mean, raw, motion, color_layout(w, h, px)
+
+    def _read_frames(self, cmd, enough) -> tuple[list, bytes]:
+        """Run ffmpeg and collect the frames as they arrive; stop it as soon as enough(frames)
+        says so, at the time limit, or when it ends. Frames that arrived are always used."""
+        try:
+            proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE)
+        except OSError:
+            return [], b""
+        with self._procs_lock:
+            self._procs.add(proc)
+        chunks: queue.Queue = queue.Queue()
+        err: list = []
+
+        def pump(stream, put):
+            try:
+                read = getattr(stream, "read1", stream.read)
+                while True:
+                    data = read(65536)
+                    put(data)
+                    if not data:
+                        return
+            except (OSError, ValueError):
+                put(b"")
+        threading.Thread(target=pump, args=(proc.stdout, chunks.put), daemon=True).start()
+        err_reader = threading.Thread(target=pump, args=(proc.stderr, err.append), daemon=True)
+        err_reader.start()
+        buf, frames = b"", []
+        deadline = time.monotonic() + self.timeout + 6
+        try:
+            while True:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    break
+                try:
+                    data = chunks.get(timeout=left)
+                except queue.Empty:
+                    break
+                if not data:
+                    break
+                buf += data
+                got = parse_ppms(buf)
+                if len(got) > len(frames):
+                    frames = got
+                    if enough(frames):
+                        break
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+            with self._procs_lock:
+                self._procs.discard(proc)
+        if not frames:
+            err_reader.join(2)           # the error text decides whether to retry
+        return frames, b"".join(x for x in err if x)
+
+    def kill_all(self):
+        with self._procs_lock:
+            for proc in list(self._procs):
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
 
 
 # =============================================================================
@@ -676,7 +1373,10 @@ def norm_url(url: str) -> str:
     u = url.strip().split("|", 1)[0]
     p = urllib.parse.urlsplit(u)
     if p.scheme and p.netloc:
-        u = urllib.parse.urlunsplit((p.scheme.lower(), p.netloc.lower(), p.path, p.query, ""))
+        # the host is case-insensitive; a login / password is not
+        userinfo, at, hostport = p.netloc.rpartition("@")
+        netloc = (userinfo + at if at else "") + hostport.lower()
+        u = urllib.parse.urlunsplit((p.scheme.lower(), netloc, p.path, p.query, ""))
     return u.rstrip("/")
 
 
@@ -686,6 +1386,38 @@ def norm_name(name: str, ignore_quality: bool) -> str:
         s = QUALITY_RE.sub(" ", s)
         s = re.sub(r"[\(\[\{]\s*[\)\]\}]", " ", s)
     return re.sub(r"[\W_]+", " ", s).strip()
+
+
+def channel_identity(c) -> tuple[str, str]:
+    """(name, tvg-id) without quality / subtitle / source words: "כאן 11 HEVC", "כאן 11 - מקור 2"
+    and "כאן 11 כתוביות" (kan11_hevc, kan11_src2, kan11_subs) are all the same channel."""
+    name = norm_name(VARIANT_RE.sub(" ", c.name or ""), True)
+    tid = (c.attrs.get("tvg-id") or "").casefold()
+    parts = [x for x in re.split(r"[\W_]+", tid) if x and not VARIANT_ID_PART.fullmatch(x)]
+    return name, "".join(parts)
+
+
+def count_distinct_channels(members) -> int:
+    """How many really different channels: versions of one channel (same name or same tvg-id
+    apart from quality / source words) count once."""
+    parent = list(range(len(members)))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+    seen: dict[tuple, int] = {}
+    for i, m in enumerate(members):
+        name, tid = channel_identity(m)
+        for key in (("n", name or m.url), ("i", tid)):
+            if not key[1]:
+                continue
+            if key in seen:
+                parent[find(i)] = find(seen[key])
+            else:
+                seen[key] = i
+    return len({find(i) for i in range(len(members))})
 
 
 def find_duplicates(channels: list[Channel], by_url: bool, by_name: bool,
@@ -726,7 +1458,8 @@ def natural_key(s: str):
 
 
 def attrs_to_str(attrs: dict) -> str:
-    return "".join(f' {k}="{str(v).replace(chr(34), chr(39))}"' for k, v in attrs.items())
+    return "".join(f' {one_line(k)}="{one_line(v).replace(chr(34), chr(39))}"'
+                   for k, v in attrs.items())
 
 
 def write_m3u(path: str, items: list[Channel], header: dict) -> None:
@@ -737,16 +1470,16 @@ def write_m3u(path: str, items: list[Channel], header: dict) -> None:
             attrs["group-title"] = c.group
         else:
             attrs.pop("group-title", None)
-        lines.append(f"#EXTINF:{c.duration}{attrs_to_str(attrs)},{c.name}")
-        lines.extend(c.extra)
-        lines.append(c.export_url())
+        lines.append(f"#EXTINF:{one_line(c.duration)}{attrs_to_str(attrs)},{one_line(c.name)}")
+        lines.extend(one_line(x) for x in c.extra)
+        lines.append(one_line(c.export_url()))
     Path(path).write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def write_pls(path: str, items: list[Channel]) -> None:
     lines = ["[playlist]"]
     for i, c in enumerate(items, 1):
-        lines += [f"File{i}={c.export_url()}", f"Title{i}={c.name}", f"Length{i}=-1"]
+        lines += [f"File{i}={one_line(c.export_url())}", f"Title{i}={one_line(c.name)}", f"Length{i}=-1"]
     lines += [f"NumberOfEntries={len(items)}", "Version=2"]
     Path(path).write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -754,12 +1487,20 @@ def write_pls(path: str, items: list[Channel]) -> None:
 FILE_PREFIX = "Playlist Checker"
 
 
+def csv_text(value) -> str:
+    """Text for a CSV cell: Excel / LibreOffice must not run a name like '=HYPERLINK(…)' as a formula."""
+    text = "" if value is None else str(value)
+    return "'" + text if text[:1] in ("=", "+", "-", "@", "\t", "\r") else text
+
+
 def dated_name(base: str, ext: str, with_date: bool, with_prefix: bool = False, suffix: str = "") -> str:
     """'tv' -> 'Playlist Checker_tv_2026-10-23.m3u8'.
-    A date and prefix already in the name (a file saved by this program earlier) are replaced,
-    so they never pile up."""
-    base = re.sub(r"[ _-]*\d{4}-\d{2}-\d{2}$", "", base)
-    base = re.sub(r"^\s*playlist[ _-]?checker(?=$|[ _-])[ _-]*", "", base, flags=re.I)
+    When the date / prefix option is on, a date / prefix already in the name (a file saved by this
+    program earlier) is replaced, so they never pile up; when it is off, the name is kept as it is."""
+    if with_date:       # only replace what this program adds - keep the user's own date / name
+        base = re.sub(r"[ _-]*\d{4}-\d{2}-\d{2}$", "", base)
+    if with_prefix:
+        base = re.sub(r"^\s*playlist[ _-]?checker(?=$|[ _-])[ _-]*", "", base, flags=re.I)
     base = base.strip(" _-")
     if not base and not with_prefix:
         base = "playlist"
@@ -806,15 +1547,114 @@ def short_source(src: str) -> str:
     return Path(src).name
 
 
-def find_player() -> str | None:
-    cands = [shutil.which("vlc"), shutil.which("mpv")]
+# video players the program can start: key -> (name shown in the menu, program names to look for)
+PLAYERS = [
+    ("vlc", "VLC", ["vlc"]),
+    ("mpv", "mpv", ["mpv"]),
+    ("celluloid", "Celluloid", ["celluloid"]),
+    ("smplayer", "SMPlayer", ["smplayer"]),
+    ("totem", "GNOME Videos (Totem)", ["totem"]),
+    ("ffplay", "ffplay (from ffmpeg)", ["ffplay"]),
+]
+PLAYER_NAMES = {k: n for k, n, _ in PLAYERS}
+
+
+def find_program(key: str) -> str | None:
+    names = next((exes for k, _, exes in PLAYERS if k == key), [key])
+    cands = [shutil.which(n) for n in names]
     if sys.platform.startswith("win"):
-        for base in (os.environ.get("ProgramFiles", r"C:\Program Files"),
-                     os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")):
-            cands.append(os.path.join(base, "VideoLAN", "VLC", "vlc.exe"))
+        pf = [os.environ.get("ProgramFiles", r"C:\Program Files"), os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")]
+        extra = {"vlc": [r"VideoLAN\VLC\vlc.exe"], "mpv": [r"mpv\mpv.exe"], "smplayer": [r"SMPlayer\smplayer.exe"]}
+        cands += [os.path.join(b, rel) for b in pf for rel in extra.get(key, [])]
     elif sys.platform == "darwin":
-        cands.append("/Applications/VLC.app/Contents/MacOS/VLC")
+        cands += {"vlc": ["/Applications/VLC.app/Contents/MacOS/VLC"],
+                  "mpv": ["/Applications/mpv.app/Contents/MacOS/mpv"]}.get(key, [])
     return next((c for c in cands if c and os.path.isfile(c)), None)
+
+
+def player_command(key: str, exe: str, url: str, name: str, ua: str | None, ref: str | None) -> list[str]:
+    """Command line that plays one stream, passing the channel's User-Agent / Referer where possible."""
+    if key == "vlc":
+        cmd = [exe, url, f":meta-title={name}"]
+        cmd += [f":http-user-agent={ua}"] if ua else []
+        cmd += [f":http-referrer={ref}"] if ref else []
+        return cmd
+    if key == "mpv":
+        cmd = [exe, "--force-window=immediate", f"--title={name}"]
+        cmd += [f"--user-agent={ua}"] if ua else []
+        cmd += [f"--referrer={ref}"] if ref else []
+        return cmd + ["--", url]
+    if key == "celluloid":
+        cmd = [exe, "--new-window"]
+        cmd += [f"--mpv-user-agent={ua}"] if ua else []
+        cmd += [f"--mpv-referrer={ref}"] if ref else []
+        return cmd + [url]
+    if key == "ffplay":
+        cmd = [exe, "-hide_banner", "-loglevel", "error", "-window_title", name]
+        cmd += ["-user_agent", ua] if ua else []
+        cmd += ["-headers", f"Referer: {ref}\r\n"] if ref else []
+        return cmd + ["-i", url]
+    return [exe, url]
+
+
+def split_command_line(template: str, windows: bool | None = None) -> list[str]:
+    """Split a custom player command. Windows follows the MS C runtime quoting rules,
+    so quoted paths such as "C:\\Program Files\\VideoLAN\\VLC\\vlc.exe" work."""
+    if windows is None:
+        windows = sys.platform.startswith("win")
+    if not windows:
+        return shlex.split(template)
+    args: list[str] = []
+    buf: list[str] = []
+    token = quoted = False
+    i = 0
+    while i < len(template):
+        ch = template[i]
+        if ch == "\\":
+            j = i
+            while j < len(template) and template[j] == "\\":
+                j += 1
+            count = j - i
+            if j < len(template) and template[j] == '"':
+                buf.append("\\" * (count // 2))
+                if count % 2:
+                    buf.append('"')
+                    j += 1
+            else:
+                buf.append("\\" * count)
+            token = True
+            i = j
+        elif ch == '"':
+            quoted = not quoted
+            token = True
+            i += 1
+        elif ch in " \t\r\n" and not quoted:
+            if token:
+                args.append("".join(buf))
+                buf, token = [], False
+            i += 1
+        else:
+            buf.append(ch)
+            token = True
+            i += 1
+    if quoted:
+        raise ValueError("unbalanced quotes in the command")
+    if token:
+        args.append("".join(buf))
+    return args
+
+
+def custom_command(template: str, url: str, name: str, ua: str | None, ref: str | None) -> list[str]:
+    parts = split_command_line(template)
+    values = {"{url}": url, "{name}": name, "{ua}": ua or DEFAULT_UA, "{referer}": ref or ""}
+    out = []
+    for part in parts:
+        for k, v in values.items():
+            part = part.replace(k, v)
+        out.append(part)
+    if "{url}" not in template:
+        out.append(url)
+    return out
 
 
 def is_hidden(path: Path) -> bool:
@@ -837,7 +1677,7 @@ def find_playlists(folder: Path, skip_hidden: bool) -> list[Path]:
         dirs.sort(key=str.casefold)
         for name in sorted(files, key=str.casefold):
             p = Path(root) / name
-            if p.suffix.lower() in PLAYLIST_EXT and not (skip_hidden and is_hidden(p)):
+            if is_playlist_name(p.name) and not (skip_hidden and is_hidden(p)):
                 found.append(p)
     return found
 
@@ -849,12 +1689,60 @@ def desktop_quote(arg: str) -> str:
     return '"' + re.sub(r'(["`$\\])', r'\\\1', arg) + '"'
 
 
+def desktop_exec_arg(arg: str) -> str:
+    """Quoted argument for Exec=; a literal % must be written %% there (%F etc. are field codes)."""
+    return desktop_quote(arg).replace("%", "%%")
+
+
+SETTING_TYPES = {
+    "timeout": (int, float), "threads": (int, float), "user_agent": str, "player": str, "player_custom": str,
+    "encoding": str, "last_dir": str, "export": dict, "geo_learned": dict, "remembered_ticks": dict,
+}
+BOOL_SETTINGS = ("deep_hls", "ignore_ssl", "dup_url", "dup_name", "dup_quality", "hide_hidden", "date_names",
+                 "prefix_names", "bidi_fix", "confirm_exit", "auto_check", "tint_rows", "hide_excluded",
+                 "remember_ticks", "geo_server", "geo_loop", "geo_picture", "geo_ask", "click_play",
+                 "replace_player", "retry_temporary")
+
+
+def clean_settings(data: dict) -> dict:
+    """Drop settings with a wrong type (damaged or hand-edited file) instead of failing to start."""
+    out = {}
+    for k, v in data.items():
+        want = SETTING_TYPES.get(k, bool if k in BOOL_SETTINGS else None)
+        if want is None:
+            ok = True                                     # unknown / free-form setting
+        elif want is bool:
+            ok = isinstance(v, bool)
+        elif want == (int, float):
+            ok = isinstance(v, (int, float)) and not isinstance(v, bool)
+        else:
+            ok = isinstance(v, want)
+        if ok:
+            out[k] = v
+    gl = out.get("geo_learned")
+    if isinstance(gl, dict):
+        def ok_pic(p, n):
+            return isinstance(p, list) and len(p) >= n and isinstance(p[0], int) and isinstance(p[1], (int, float))
+        # older versions stored only [fingerprint, brightness] - such entries still work
+        out["geo_learned"] = {"pics": [p[:4] for p in gl.get("pics", []) if ok_pic(p, 2)]
+                              if isinstance(gl.get("pics"), list) else [],
+                              "segs": [x for x in gl.get("segs", []) if isinstance(x, str)]
+                              if isinstance(gl.get("segs"), list) else [],
+                              "rejected": [p[:3] for p in gl.get("rejected", []) if ok_pic(p, 2)]
+                              if isinstance(gl.get("rejected"), list) else []}
+    rt = out.get("remembered_ticks")
+    if isinstance(rt, dict):
+        out["remembered_ticks"] = {k: [x for x in rt.get(k, []) if isinstance(x, str)]
+                                   if isinstance(rt.get(k), list) else [] for k in ("groups_off", "playlists_off")}
+    return out
+
+
 def load_settings() -> dict:
     for f in (SETTINGS_FILE, OLD_SETTINGS_FILE):
         try:
             data = json.loads(f.read_text(encoding="utf-8"))
             if isinstance(data, dict):
-                return data
+                return clean_settings(data)
         except Exception:
             continue
     return {}
@@ -882,13 +1770,114 @@ class ComboDialog(simpledialog.Dialog):
         return cb
 
     def apply(self):
-        value = self.var.get().strip()
+        value = one_line(self.var.get()).strip()
         self.result = self.to_logical.get(value, value)
+
+
+class TextDialog(simpledialog.Dialog):
+    """Ask for a text, showing a Hebrew / Arabic initial value the right way round."""
+
+    def __init__(self, parent, title, prompt, initial=""):
+        self.prompt, self.initial, self.result = prompt, initial, None
+        super().__init__(parent, title)
+
+    def body(self, master):
+        ttk.Label(master, text=vis(self.prompt)).pack(anchor="w", padx=6, pady=(6, 2))
+        self.var = tk.StringVar(value=vis(self.initial))
+        entry = ttk.Entry(master, textvariable=self.var, width=48)
+        entry.pack(fill="x", padx=6, pady=(2, 6))
+        entry.select_range(0, "end")
+        return entry
+
+    def apply(self):
+        value = one_line(self.var.get()).strip()
+        # unchanged: give back the real (logical) text, not the reordered one shown on screen
+        self.result = self.initial.strip() if value == vis(self.initial).strip() else value
+
+
+def ppm_to_photo(master, ppm: bytes) -> tk.PhotoImage | None:
+    """Thumbnail -> Tk image (raw PPM where Tk accepts it, else pixel by pixel)."""
+    try:
+        return tk.PhotoImage(master=master, data=ppm)
+    except tk.TclError:
+        pass
+    img_data = parse_ppm(ppm)
+    if not img_data:
+        return None
+    w, h, px = img_data
+    img = tk.PhotoImage(master=master, width=w, height=h)
+    rows = []
+    for y in range(h):
+        row = px[y * w * 3:(y + 1) * w * 3]
+        rows.append("{" + " ".join("#%02x%02x%02x" % (row[i], row[i + 1], row[i + 2])
+                                   for i in range(0, len(row), 3)) + "}")
+    img.put(" ".join(rows))
+    return img
+
+
+class SamePictureDialog(tk.Toplevel):
+    """Several channels show exactly the same picture: probably a 'not available in your country' banner."""
+
+    def __init__(self, parent, members, ppm: bytes | None, distinct: int | None = None):
+        super().__init__(parent)
+        self.result = None
+        self.title("Same picture on several channels")
+        self.transient(parent)
+        self.resizable(False, False)
+        body = ttk.Frame(self, padding=14)
+        body.pack(fill="both", expand=True)
+        if ppm:
+            try:
+                img = ppm_to_photo(self, ppm)
+                if img is None:
+                    raise tk.TclError("no image")
+                self._img = img.zoom(3)
+                ttk.Label(body, image=self._img, relief="solid").grid(row=0, column=0, rowspan=2, sticky="n",
+                                                                       padx=(0, 14))
+            except tk.TclError:
+                pass
+        ttk.Label(body, wraplength=380, justify="left",
+                  text=vis(f"{distinct or len(members)} different channels ({len(members)} streams) show "
+                           "exactly this picture, and it did not change a few seconds later.\n\n"
+                           "This is usually a “not available in your country” banner (or another "
+                           "placeholder). Mark them as geo-blocked? They will be left out when saving, "
+                           "and the program will recognise this picture in future checks.")
+                  ).grid(row=0, column=1, sticky="nw")
+        lf = ttk.Frame(body)
+        lf.grid(row=1, column=1, sticky="nsew", pady=(10, 0))
+        lb = tk.Listbox(lf, height=min(8, len(members)), width=48, activestyle="none")
+        for m in members:
+            lb.insert("end", vis(f"{m.name}   ({m.group or NO_GROUP})"))
+        sb = ttk.Scrollbar(lf, orient="vertical", command=lb.yview)
+        lb.configure(yscrollcommand=sb.set)
+        lb.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        bf = ttk.Frame(body)
+        bf.grid(row=2, column=0, columnspan=2, sticky="e", pady=(14, 0))
+        ttk.Button(bf, text="⛔  Mark as geo-blocked", command=lambda: self._done("block")).pack(side="left", padx=3)
+        ttk.Button(bf, text="Not a banner", command=lambda: self._done("not")).pack(side="left", padx=3)
+        ttk.Button(bf, text="Decide later", command=lambda: self._done(None)).pack(side="left", padx=3)
+        self.protocol("WM_DELETE_WINDOW", lambda: self._done(None))
+        self.bind("<Escape>", lambda e: self._done(None))
+        self.update_idletasks()
+        x = parent.winfo_rootx() + (parent.winfo_width() - self.winfo_width()) // 2
+        y = parent.winfo_rooty() + (parent.winfo_height() - self.winfo_height()) // 3
+        self.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+        try:
+            self.grab_set()
+        except tk.TclError:
+            pass
+        self.wait_window(self)
+
+    def _done(self, value):
+        self.result = value
+        self.destroy()
 
 
 class ExportDialog(simpledialog.Dialog):
     OPTIONS = [
         ("drop_offline", "Remove offline channels", True),
+        ("drop_blocked", "Remove geo-blocked channels (“not available in your country”)", True),
         ("drop_dups", "Remove duplicates", True),
         ("drop_unchecked", "Remove channels that were not checked", False),
         ("only_enabled_groups", "Only groups and playlists ticked ☑ on the left", True),
@@ -962,8 +1951,11 @@ class App(tk.Tk):
         self._dl_stop = threading.Event()
         self._dl_gen = 0           # changes on "Clear list", so late downloads are ignored
         self._dl: dict = {}
+        self._dl_queue: list[tuple] = []   # downloads asked for while others were running
         self._dl_last_refresh = 0.0
         self._previous: dict[int, tuple] = {}
+        self._manual_locked: set[int] = set()   # manually marked while a check was running
+        self._aux_checkers: set = set()         # picture checkers of Mark / same-picture dialogs
 
         self.v_hide_hidden = tk.BooleanVar(value=self.settings.get("hide_hidden", True))
         self.v_date_names = tk.BooleanVar(value=self.settings.get("date_names", True))
@@ -974,6 +1966,27 @@ class App(tk.Tk):
         self.v_auto_check = tk.BooleanVar(value=self.settings.get("auto_check", False))
         self.v_tint = tk.BooleanVar(value=self.settings.get("tint_rows", True))
         self.v_hide_excluded = tk.BooleanVar(value=self.settings.get("hide_excluded", True))
+        self.v_remember_ticks = tk.BooleanVar(value=self.settings.get("remember_ticks", True))
+        self.v_player = tk.StringVar(value=self.settings.get("player", "auto"))
+        self.v_click_play = tk.BooleanVar(value=self.settings.get("click_play", True))
+        self.v_replace_player = tk.BooleanVar(value=self.settings.get("replace_player", True))
+        self._player_proc = None
+        self._last_play = (None, 0.0)
+        self._restored_groups: set[str] = set()     # unticked from memory during the last load
+        self._restored_sources: set[str] = set()
+        self.ffmpeg = find_ffmpeg()
+        self.v_geo_server = tk.BooleanVar(value=self.settings.get("geo_server", True))
+        self.v_geo_loop = tk.BooleanVar(value=self.settings.get("geo_loop", True))
+        self.v_retry = tk.BooleanVar(value=self.settings.get("retry_temporary", True))
+        self._retrying = 0
+        self._retry_result = None
+        self.v_geo_picture = tk.BooleanVar(value=self.settings.get("geo_picture", True) and bool(self.ffmpeg))
+        self.v_geo_ask = tk.BooleanVar(value=self.settings.get("geo_ask", True))
+        self._thumbs: dict[int, bytes] = {}
+        self.pic_total = self.pic_done = 0
+        self._pictures_only = False
+        self._pic_phase = False
+        self._pic_phase_start = 0.0
         self.source_color: dict[str, int] = {}     # playlist -> color number
         self.source_enabled: dict[str, bool] = {}  # playlist ticked for saving
         self.current_source: str | None = None
@@ -1041,6 +2054,7 @@ class App(tk.Tk):
         m.add_command(label="Delete selected", accelerator="Del", command=self.delete_selected)
         m.add_separator()
         m.add_command(label="Remove all offline channels from list", command=self.remove_offline)
+        m.add_command(label="Remove all geo-blocked channels from list", command=self.remove_blocked)
         m.add_command(label="Remove all duplicates from list", command=self.remove_duplicates)
         mb.add_cascade(label="Edit", menu=m)
 
@@ -1050,6 +2064,8 @@ class App(tk.Tk):
         m.add_command(label="Check selected channels", command=self.check_selected)
         m.add_separator()
         m.add_command(label="Recheck offline / broken channels", accelerator="Shift+F5", command=self.recheck_offline)
+        m.add_command(label="Find “not available” banners in online channels (picture check)",
+                      command=self.find_banners)
         m.add_command(label="Stop", accelerator="Esc", command=self.stop_check)
         mb.add_cascade(label="Check", menu=m)
 
@@ -1065,16 +2081,36 @@ class App(tk.Tk):
         m.add_checkbutton(label="Confirm before exit", variable=self.v_confirm_exit, command=self.save_settings)
         m.add_checkbutton(label="Check new channels automatically after loading", variable=self.v_auto_check,
                           command=self.save_settings)
+        m.add_checkbutton(label="Try again channels with temporary errors (timeout, HTTP 5xx)",
+                          variable=self.v_retry, command=self.save_settings)
+        m.add_checkbutton(label="Remember ticked / unticked groups and playlists", variable=self.v_remember_ticks,
+                          command=self.on_remember_option)
+        m.add_command(label="Forget remembered groups and playlists…", command=self.forget_ticks)
         m.add_checkbutton(label="Hide unticked groups and playlists in the channel list",
                           variable=self.v_hide_excluded,
                           command=lambda: (self.save_settings(), self.refresh_channels()))
         m.add_checkbutton(label="Tint rows with the playlist color", variable=self.v_tint,
                           command=lambda: (self.save_settings(), self.refresh_channels()))
         m.add_separator()
+        geo = tk.Menu(m, tearoff=0)
+        geo.add_checkbutton(label="By the server's answer (451, 403 “your country”, redirects)",
+                            variable=self.v_geo_server, command=self.save_settings)
+        geo.add_checkbutton(label="Short looping video instead of live TV", variable=self.v_geo_loop,
+                            command=self.save_settings)
+        geo.add_checkbutton(label="By the picture – “not available” banners" +
+                            ("" if self.ffmpeg else "  (needs ffmpeg)"),
+                            variable=self.v_geo_picture, command=self.on_picture_option)
+        geo.add_checkbutton(label="Ask when several channels show the same picture", variable=self.v_geo_ask,
+                            command=self.save_settings)
+        geo.add_separator()
+        geo.add_command(label="Forget learned banners…", command=self.forget_banners)
+        m.add_cascade(label="Detect geo-blocked channels", menu=geo)
         enc = tk.Menu(m, tearoff=0)
         for value, label in LEGACY_ENCODINGS:
             enc.add_radiobutton(label=label, value=value, variable=self.v_encoding, command=self.save_settings)
         m.add_cascade(label="Encoding of old (non-UTF-8) playlists", menu=enc)
+        pm = tk.Menu(m, tearoff=0, postcommand=lambda: self._fill_player_menu(pm))
+        m.add_cascade(label="Video player", menu=pm)
         uam = tk.Menu(m, tearoff=0)
         for i, (section, items) in enumerate(USER_AGENTS):
             if i:
@@ -1242,7 +2278,7 @@ class App(tk.Tk):
         tf.pack(fill="both", expand=True, pady=(4, 0))
         self.cols = ("num", "status", "name", "group", "info", "dup", "url", "source")
         self.col_titles = {"num": "#", "status": "Status", "name": "Channel", "group": "Group",
-                           "info": "Check result", "dup": "Duplicate", "url": "Stream URL", "source": "Playlist"}
+                           "info": "Check result", "dup": "Duplicate", "url": self._url_title(), "source": "Playlist"}
         widths = {"num": 50, "status": 125, "name": 210, "group": 130, "info": 230, "dup": 120, "url": 330, "source": 110}
         self.tree = ttk.Treeview(tf, columns=self.cols, show="tree headings", selectmode="extended")
         self.tree.column("#0", width=30, minwidth=30, stretch=False, anchor="center")  # playlist color
@@ -1261,17 +2297,21 @@ class App(tk.Tk):
         self.tree.tag_configure("excluded", foreground="#a0a0a0")
         self.tree.tag_configure(ONLINE, foreground="#1b7a34")
         self.tree.tag_configure(OFFLINE, foreground="#c62828")
+        self.tree.tag_configure(BLOCKED, foreground="#8e24aa")
         self.tree.tag_configure(CHECKING, foreground="#1565c0")
         self.tree.tag_configure(UNCHECKED, foreground="#555555")
         self.tree.tag_configure("dup", background="#fff1c4")
 
         self.cmenu = tk.Menu(self, tearoff=0)
-        self.cmenu.add_command(label="▶ Play (VLC)", command=self.play_selected)
+        self.cmenu.add_command(label="▶ Play", command=self.play_selected)
         self.cmenu.add_command(label="Copy URL", accelerator="Ctrl+C", command=self.copy_url)
         self.cmenu.add_command(label="Paste stream links / playlist", accelerator="Ctrl+V", command=self.paste_channels)
         self.cmenu.add_separator()
         self.cmenu.add_command(label="Check selected", command=self.check_selected)
         self.cmenu.add_command(label="Recheck all offline / broken", command=self.recheck_offline)
+        self.cmenu.add_separator()
+        self.cmenu.add_command(label="⛔ Mark as geo-blocked (shows “not available” banner)", command=self.mark_blocked)
+        self.cmenu.add_command(label="Not geo-blocked (undo, check again)", command=self.unmark_blocked)
         self.cmenu.add_separator()
         self.cmenu.add_command(label="Rename channel…", command=self.rename_channel)
         self.cmenu.add_command(label="Move to group…", command=self.move_to_group)
@@ -1280,6 +2320,10 @@ class App(tk.Tk):
         self.tree.bind("<Button-3>", self.on_right_click)
         self.tree.bind("<Button-2>", self.on_right_click)  # macOS
         self.tree.bind("<Control-KeyPress>", self._tree_ctrl_key)
+        self.tree.bind("<ButtonPress-1>", self.on_tree_press, add="+")
+        self.tree.bind("<ButtonRelease-1>", self.on_tree_click, add="+")
+        self.tree.bind("<Motion>", self.on_tree_motion, add="+")
+        self.tree.bind("<Leave>", lambda e: self.tree.configure(cursor=""), add="+")
         self.tree.bind("<Double-1>", lambda e: self.play_selected())
         self.tree.bind("<Return>", lambda e: self.play_selected())
 
@@ -1317,8 +2361,9 @@ class App(tk.Tk):
     def open_files(self):
         paths = self._fd().askopenfilenames(
             parent=self, title="Open playlists", initialdir=self.settings.get("last_dir") or str(Path.home()),
-            filetypes=[("Playlists", "*.m3u *.m3u8 *.pls *.xspf"), ("Lists of playlist URLs", "*.txt *.list"),
-                       ("All files", "*.*")])
+            filetypes=[("Playlists", "*.m3u *.m3u8 *.pls *.xspf "
+                                      "*.m3u.gz *.m3u8.gz *.pls.gz *.xspf.gz"),
+                       ("Lists of playlist URLs", "*.txt *.list"), ("All files", "*.*")])
         if not paths:
             return
         self.settings["last_dir"] = str(Path(paths[0]).parent)
@@ -1337,7 +2382,8 @@ class App(tk.Tk):
         self.settings["last_dir"] = d
         files = find_playlists(Path(d), self.v_hide_hidden.get())
         if not files:
-            messagebox.showinfo(APP_TITLE, "No playlist files (.m3u .m3u8 .pls .xspf) in this folder.", parent=self)
+            messagebox.showinfo(APP_TITLE, "No playlist files (.m3u .m3u8 .pls .xspf, also .gz) "
+                                            "in this folder.", parent=self)
             return
         self.after_load(sum(self.load_path(f) for f in files))
 
@@ -1348,26 +2394,9 @@ class App(tk.Tk):
         self._start_download(url.strip())
 
     def _start_download(self, url: str):
-        self.set_status(f"Downloading playlist {url} …")
-        self.progress.configure(mode="indeterminate")
-        self.progress.start(12)
-        threading.Thread(target=self._fetch_playlist, args=(url, self.v_ua.get().strip() or DEFAULT_UA,
-                                                            self.v_ssl.get(), self.v_encoding.get()),
-                         daemon=True).start()
-
-    def _fetch_playlist(self, url, ua, ignore_ssl, legacy):
-        try:
-            kind, text = fetch_playlist(url, ua, ignore_ssl, legacy)
-            if kind == "playlist":
-                self.q.put(("loaded", text, url))
-            elif kind == "stream":
-                self.q.put(("stream", url))
-            else:
-                self.q.put(("error", f"This address returns a web page, not a playlist:\n{url}\n\n"
-                                     "Check the address, or whether the provider needs a login or another "
-                                     "User-Agent (Settings → User-Agent)."))
-        except Exception as e:
-            self.q.put(("error", f"Could not download the playlist:\n{url}\n\n{short_error(e)}"))
+        """One playlist address (File → Open URL / command line): a download of one, so it can be
+        stopped, is cancelled by “Clear list” and waits for downloads that are already running."""
+        self._download_many([url], url, source=url, single=True)
 
     # ------------------------------------------------------------------ list of playlist URLs (.txt)
     def open_url_list(self):
@@ -1382,11 +2411,10 @@ class App(tk.Tk):
     def load_url_list(self, path: Path):
         """Text file with one playlist address per line -> download every playlist."""
         try:
-            data = path.read_bytes()
-        except OSError as e:
+            text = decode_bytes(path.read_bytes(), self.v_encoding.get())
+        except (OSError, DamagedFileError) as e:
             messagebox.showerror(APP_TITLE, f"Could not open {path}:\n{e}", parent=self)
             return
-        text = decode_bytes(data, self.v_encoding.get())
         if looks_like_playlist_text(text):  # it is a playlist saved as .txt
             self.after_load(self.add_playlist_text(text, str(path), str(path.parent.resolve())))
             return
@@ -1401,44 +2429,52 @@ class App(tk.Tk):
         added = self.add_stream_urls(streams, str(path)) if streams else 0
         added += sum(self.load_path(p) for p in local)
         if added:
-            self.after_load(added)
+            self.after_load(added, defer_check=bool(web))   # checked when the downloads are done
         if web:
-            self._download_many(web, path.name, added, source=str(path))
+            self._download_many(web, path.name, source=str(path), shown=added)
 
     def add_stream_urls(self, urls: list[str], source: str, group: str = "") -> int:
         g_attr = f' group-title="{group.replace(chr(34), chr(39))}"' if group else ""
         playlist = "#EXTM3U\n" + "".join(f"#EXTINF:-1{g_attr},{name_from_url(u)}\n{u}\n" for u in urls)
         return self.add_playlist_text(playlist, source, "")
 
-    def _download_many(self, urls: list[str], label: str, already_added: int = 0, source: str = ""):
+    def _download_many(self, urls: list[str], label: str, source: str = "", single: bool = False,
+                       shown: int = 0):
+        """Download playlists in the background. shown: channels of the same list (direct links,
+        local files) that were already added - they count for the automatic check at the end.
+        While other downloads are running, this one waits for them."""
         if self.downloading:
-            messagebox.showinfo(APP_TITLE, "Playlists are still being downloaded – wait or press Stop.", parent=self)
+            self._dl_queue.append((urls, label, source, single, shown))
+            self.set_status(f"{label}: waits until the running downloads are finished …")
             return
         self.downloading = True
-        self._dl_stop.clear()
+        self._dl_stop = stop = threading.Event()      # a new one: an old worker stays stopped
         for u in urls:  # colors follow the order of the list, not the order the downloads finish
             self._source_index(u)
         self._dl = {"label": label, "source": source, "total": len(urls), "done": 0, "ok": 0, "streams": 0,
-                    "channels": already_added, "failed": [], "gen": self._dl_gen}
-        self.progress.stop()
-        self.progress.configure(mode="determinate", maximum=len(urls), value=0)
+                    "channels": 0, "shown": shown, "failed": [], "gen": self._dl_gen, "single": single}
+        if not self.checking:                         # the progress bar belongs to a running check
+            self.progress.stop()
+            if single:
+                self.progress.configure(mode="indeterminate")
+                self.progress.start(12)
+            else:
+                self.progress.configure(mode="determinate", maximum=len(urls), value=0)
         self.btn_stop.state(["!disabled"])
-        self.set_status(f"Downloading {len(urls)} playlists from {label} …")
-        args = (urls, self.v_ua.get().strip() or DEFAULT_UA, self.v_ssl.get(), self.v_encoding.get(), self._dl_gen)
+        self.set_status(f"Downloading playlist {label} …" if single else
+                        f"Downloading {len(urls)} playlists from {label} …")
+        args = (urls, self.v_ua.get().strip() or DEFAULT_UA, self.v_ssl.get(), self.v_encoding.get(),
+                self._dl_gen, stop)
         threading.Thread(target=self._download_worker, args=args, daemon=True).start()
 
-    def _download_worker(self, urls, ua, ignore_ssl, legacy, gen):
-        stop = self._dl_stop
-
+    def _download_worker(self, urls, ua, ignore_ssl, legacy, gen, stop):
         def task(url):
             if stop.is_set():
-                return url, "skipped", ""
+                return url, "skipped", "", ""
             try:
                 return (url,) + fetch_playlist(url, ua, ignore_ssl, legacy)
-            except urllib.error.HTTPError as e:
-                return url, "error", f"HTTP {e.code} {e.reason}".strip()
             except Exception as e:
-                return url, "error", short_error(e)
+                return url, "error", short_error(e), ""
 
         ex = ThreadPoolExecutor(max_workers=DOWNLOAD_PARALLEL)
         try:
@@ -1446,18 +2482,19 @@ class App(tk.Tk):
             while pending and not stop.is_set():
                 done, pending = wait(pending, timeout=0.25, return_when=FIRST_COMPLETED)
                 for f in done:
-                    self.q.put(("dl_item", gen) + f.result())
+                    if not stop.is_set():
+                        self.q.put(("dl_item", gen) + f.result())
         finally:
             ex.shutdown(wait=False, cancel_futures=True)
             self.q.put(("dl_done", gen, stop.is_set()))
 
-    def _download_item(self, gen, url, kind, text):
+    def _download_item(self, gen, url, kind, text, base=""):
         if gen != self._dl_gen:
             return
         d = self._dl
         d["done"] += 1
         if kind == "playlist":
-            n = self.add_playlist_text(text, url, "", quiet=True)
+            n = self.add_playlist_text(text, url, "", quiet=True, base_url=base)
             if n < 0:
                 d["failed"].append((url, "not a readable playlist"))
             elif n == 0:
@@ -1469,38 +2506,67 @@ class App(tk.Tk):
             d["streams"] += 1
             d["channels"] += self.add_stream_urls([url], d.get("source") or url)
         elif kind == "page":
-            d["failed"].append((url, "web page instead of a playlist (wrong address or login needed)"))
+            why = ("the server answered with a web page or a message instead of a playlist "
+                   "(wrong address, login needed or not available)")
+            d["failed"].append((url, why + (f":\n   {text}" if text else "")))
         elif kind != "skipped":
             d["failed"].append((url, text or "download failed"))
-        self.progress["value"] = d["done"]
-        self.set_status(f"Downloading playlists from {d['label']}: {d['done']} / {d['total']} · "
-                        f"{d['channels']} channels so far")
+        if not self.checking and not d["single"]:
+            self.progress["value"] = d["done"]
+        if not d["single"]:
+            self.set_status(f"Downloading playlists from {d['label']}: {d['done']} / {d['total']} · "
+                            f"{d['channels']} channels so far")
         now = time.monotonic()
         if now - self._dl_last_refresh > 1.5:  # keep the window responsive with big lists
             self._dl_last_refresh = now
             self.refresh_all()
 
     def _download_finished(self, gen, stopped):
-        if gen != self._dl_gen:
-            self.downloading = False
+        if gen != self._dl_gen:            # cleared meanwhile: clear_all() already reset everything
             return
         d = self._dl
         self.downloading = False
         if not self.checking:
             self.btn_stop.state(["disabled"])
-        self.after_load(d["channels"])
-        parts = [f"{d['ok']} of {d['total']} playlists loaded"]
-        if d["streams"]:
-            parts.append(f"{d['streams']} direct stream link(s)")
-        parts.append(f"{d['channels']} channels added")
-        if d["failed"]:
-            parts.append(f"{len(d['failed'])} failed")
-        self.set_status(("Stopped. " if stopped else "") + f"{d['label']}: " + " · ".join(parts) + ".")
-        if d["failed"]:
-            lines = [f"• {u}\n   {why}" for u, why in d["failed"][:12]]
-            more = f"\n…and {len(d['failed']) - 12} more" if len(d["failed"]) > 12 else ""
-            messagebox.showwarning(APP_TITLE, f"{len(d['failed'])} of {d['total']} addresses could not be loaded:\n\n"
-                                   + "\n".join(lines) + more, parent=self)
+            self.progress.stop()
+            self.progress.configure(mode="determinate", value=0 if d["single"] else d["done"])
+        if stopped:
+            self._dl_queue.clear()         # Stop stops the waiting downloads too
+        # channels added before the download (direct links / files of the same list) were already
+        # reported - only start the automatic check for them now
+        self.after_load(d["channels"], check_also=d["shown"])
+        if d["single"]:
+            self._single_download_finished(d, stopped)
+        else:
+            parts = [f"{d['ok']} of {d['total']} playlists loaded"]
+            if d["streams"]:
+                parts.append(f"{d['streams']} direct stream link(s)")
+            parts.append(f"{d['channels']} channels added")
+            if d["failed"]:
+                parts.append(f"{len(d['failed'])} failed")
+            self.set_status(("Stopped. " if stopped else "") + f"{d['label']}: " + " · ".join(parts) + ".")
+            if d["failed"]:
+                lines = [f"• {u}\n   {why}" for u, why in d["failed"][:12]]
+                more = f"\n…and {len(d['failed']) - 12} more" if len(d["failed"]) > 12 else ""
+                messagebox.showwarning(APP_TITLE, f"{len(d['failed'])} of {d['total']} addresses could not be "
+                                       "loaded:\n\n" + "\n".join(lines) + more, parent=self)
+        if self._dl_queue and not self.downloading:
+            self._download_many(*self._dl_queue.pop(0))
+
+    def _single_download_finished(self, d, stopped):
+        url = d["label"]
+        if stopped and not d["done"]:
+            self.set_status(f"Download stopped: {url}")
+        elif d["streams"]:
+            self.set_status("That address is a single TV/radio stream, not a playlist – "
+                            "it was added as one channel.")
+        elif d["failed"]:
+            self.set_status("Download failed.")
+            why = d["failed"][0][1]
+            if why.startswith("the server answered with"):
+                why += ("\n\nCheck the address, or whether the provider needs a login or another "
+                        "User-Agent (Settings → User-Agent).")
+            messagebox.showerror(APP_TITLE, f"Could not download the playlist:\n{url}\n\n{why}", parent=self)
 
     def load_path(self, path: Path) -> int:
         try:
@@ -1508,14 +2574,27 @@ class App(tk.Tk):
         except OSError as e:
             messagebox.showerror(APP_TITLE, f"Could not open {path}:\n{e}", parent=self)
             return 0
-        if b"\x00" in data[:4096]:
+        try:
+            data = unpack_bytes(data)
+        except DamagedFileError as e:
+            messagebox.showerror(APP_TITLE, f"{path.name}: {e}.", parent=self)
+            return 0
+        if b"\x00" in data[:4096] and not has_unicode_bom(data):
             messagebox.showerror(APP_TITLE, f"{path.name} is not a text playlist.", parent=self)
             return 0
         text = decode_bytes(data, self.v_encoding.get())
+        if is_hls_text(text):
+            # an HLS stream saved as a file (its segments / quality variants), not a channel list
+            n = self.add_stream_urls([str(path)], str(path))
+            self.set_status(f"{path.name} is a single HLS stream, not a list of channels – "
+                            "it was added as one channel.")
+            return n
         return self.add_playlist_text(text, str(path), str(path.parent.resolve()))
 
-    def add_playlist_text(self, text: str, source: str, base_dir: str = "", quiet: bool = False) -> int:
-        """Add the channels of a playlist; returns how many (or -1 if quiet and it can't be read)."""
+    def add_playlist_text(self, text: str, source: str, base_dir: str = "", quiet: bool = False,
+                          base_url: str = "") -> int:
+        """Add the channels of a playlist; returns how many (or -1 if quiet and it can't be read).
+        base_url: the address the playlist really came from (after a redirect) - for relative links."""
         try:
             header, chans = parse_playlist(text, source, base_dir)
         except Exception as e:
@@ -1524,28 +2603,45 @@ class App(tk.Tk):
             messagebox.showerror(APP_TITLE, f"Could not read {source}:\n{e}", parent=self)
             return 0
         for k, v in header.items():
-            self.header.setdefault(k, v)
+            if k.lower() in ("url-tvg", "x-tvg-url", "tvg-url") and k in self.header and v:
+                have = [u.strip() for u in self.header[k].split(",") if u.strip()]
+                for u in (x.strip() for x in v.split(",")):
+                    if u and u not in have:
+                        have.append(u)                       # several guides: comma-separated list
+                self.header[k] = ",".join(have)
+            else:
+                self.header.setdefault(k, v)
         remote = re.match(r"^https?://", source, re.I) is not None
+        # the login of the playlist address belongs to the download, not to a Kodi |header suffix
+        source_base = split_url_headers(source)[0] if remote else source
         for c in chans:
             if remote and is_local(c.url) and not re.match(r"^[a-zA-Z]:[\\/]", c.url):
-                c.url = urllib.parse.urljoin(source, c.url)  # link relative to the playlist's web address
+                # relative to the address the playlist really came from; keep a login on the
+                # same server (or an http -> https upgrade), never send it to another server
+                c.url = with_login(urllib.parse.urljoin(base_url or source_base, c.url), source_base)
             self.uid_counter += 1
             c.uid = self.uid_counter
             self.channels.append(c)
             self.by_uid[c.uid] = c
             self._source_index(c.source)
             if c.group not in self.group_enabled:
-                self.group_enabled[c.group] = True
+                self.group_enabled[c.group] = self._initial_group_state(c.group)
                 self.group_order.append(c.group)
         return len(chans)
 
-    def after_load(self, added: int):
+    def after_load(self, added: int, check_also: int = 0, defer_check: bool = False):
+        """added: new channels. check_also: channels added (and reported) earlier that still wait for
+        the automatic check. defer_check: more channels are coming - check them all together later."""
         reset = added > 0 and self._reset_view_filters()
+        new = added + check_also
+        restored_g, restored_p = len(self._restored_groups), len(self._restored_sources)
+        self._restored_groups.clear()
+        self._restored_sources.clear()
         self.recompute_duplicates()
         self.refresh_all()
-        if added > 0 and self.checking:
+        if new > 0 and self.checking:
             self._pending_check = True       # checked as soon as the running check ends
-        elif added > 0 and self.v_auto_check.get() and not self.downloading:
+        elif new > 0 and self.v_auto_check.get() and not self.downloading and not defer_check:
             self.after(300, self._auto_check)
         dups = sum(1 for c in self.channels if c.dup_of)
         playlists = len({c.source for c in self.channels})
@@ -1557,6 +2653,10 @@ class App(tk.Tk):
             text += " Press “Check streams” to test them."
         if reset:
             text += " (Filters were reset so the new channels are visible.)"
+        if restored_g or restored_p:
+            parts = ([f"{restored_g} group{'s' if restored_g != 1 else ''}"] if restored_g else []) + \
+                    ([f"{restored_p} playlist{'s' if restored_p != 1 else ''}"] if restored_p else [])
+            text += f" {' and '.join(parts)} unticked as you left them last time."
         self.set_status(text)
 
     def _reset_view_filters(self) -> bool:
@@ -1600,7 +2700,7 @@ class App(tk.Tk):
         Uses double the timeout, so slow servers get a second, fairer chance."""
         if self.checking:
             return
-        targets = [c for c in self.channels if c.status == OFFLINE and self._included(c)]
+        targets = [c for c in self.channels if c.status in (OFFLINE, BLOCKED) and self._included(c)]
         if not targets:
             messagebox.showinfo(APP_TITLE, "There are no offline channels to recheck.\n"
                                            "Run “Check streams” first.", parent=self)
@@ -1613,7 +2713,7 @@ class App(tk.Tk):
     def check_selected(self):
         self.start_check([self.by_uid[int(i)] for i in self.tree.selection()])
 
-    def start_check(self, targets: list[Channel], recheck: bool = False):
+    def start_check(self, targets: list[Channel], recheck: bool = False, pictures_only: bool = False):
         if self.checking:
             return
         if not targets:
@@ -1622,38 +2722,118 @@ class App(tk.Tk):
         self.save_settings()
         timeout = min(max(self._int(self.v_timeout, 8), 1), 120) * (2 if recheck else 1)
         threads = min(max(self._int(self.v_threads, 20), 1), 200)
-        checker = StreamChecker(timeout, self.v_ua.get().strip(), self.v_deep.get(), self.v_ssl.get())
+        self.ffmpeg = self.ffmpeg or find_ffmpeg()
+        pictures = (self.v_geo_picture.get() or pictures_only) and bool(self.ffmpeg)
+        checker = StreamChecker(timeout, self.v_ua.get().strip(), self.v_deep.get(), self.v_ssl.get(),
+                                self.v_geo_server.get(), self.v_geo_loop.get(), self.ffmpeg if pictures else None)
+        self._checker = checker
         jobs = []
         self._recheck = {c.uid for c in targets} if recheck else None
         self._previous = {c.uid: (c.status, c.info, c.latency) for c in targets}  # restored if stopped
         for c in targets:
-            c.status, c.info, c.latency = CHECKING, "", None
+            if not pictures_only:
+                c.status, c.info, c.latency = CHECKING, "", None
+                c.seg_hash = None
+                c.audio = False
+            c.pic_hash, c.pic_spread, c.pic_gray = None, 0.0, 0.0   # never judge by an old picture
+            c.pic_motion, c.pic_colors = None, None
             ua, ref = c.http_options()
             jobs.append((c.uid, c.url, c.base_dir, ua, ref))
         self.stop_event.clear()
         self.checking = True
-        self.check_total, self.check_done = len(jobs), 0
+        self._pictures_only = pictures_only
+        self.pic_total = self.pic_done = 0
+        self._pic_phase = pictures_only
+        self._pic_phase_start = time.monotonic()
+        self._thumbs.clear()
+        self.check_total, self.check_done = (0 if pictures_only else len(jobs)), 0
         self.progress.stop()
-        self.progress.configure(mode="determinate", maximum=len(jobs), value=0)
+        self.progress.configure(mode="determinate", maximum=max(len(jobs), 1), value=0)
         self.btn_check.state(["disabled"])
         self.btn_recheck.state(["disabled"])
         self.btn_stop.state(["!disabled"])
         self.refresh_channels()
         self.set_status(self._progress_text())
-        threading.Thread(target=self._check_worker, args=(checker, jobs, threads), daemon=True).start()
+        self._retrying = 0
+        self._retry_result = None
+        retry = self.v_retry.get() and not pictures_only
+        threading.Thread(target=self._check_worker, args=(checker, jobs, threads, pictures, pictures_only, retry),
+                         daemon=True).start()
 
-    def _check_worker(self, checker: StreamChecker, jobs, threads):
+    def _check_worker(self, checker: StreamChecker, jobs, threads, pictures: bool, pictures_only: bool,
+                      retry: bool = False):
         stop = self.stop_event
+        by_uid = {j[0]: j for j in jobs}
 
-        def task(job):
+        def task(job, chk=checker):
             uid, url, base, ua, ref = job
             if stop.is_set():
                 return uid, None
-            return uid, checker.check(url, base, ua, ref)
+            return uid, chk.check_full(url, base, ua, ref)
 
-        ex = ThreadPoolExecutor(max_workers=threads)
-        try:
-            pending = {ex.submit(task, j) for j in jobs}
+        pic_src: dict[int, tuple] = {}            # uid -> (address for ffmpeg, is HLS)
+        pic_same: dict[str, list] = {}            # same address -> all channels using it
+
+        def pic_task(uid):
+            _, _, _, ua, ref = by_uid[uid]
+            url, hls = pic_src[uid]
+            if stop.is_set():
+                return uid, None
+            return uid, checker.grab_picture(url, ua, ref, hls)
+
+        def wants_picture(uid, res) -> bool:
+            if not pictures or res is None or res[0] != ONLINE or res[3].get("audio"):
+                return False
+            url = by_uid[uid][1]
+            return url.lower().startswith(("http://", "https://", "rtmp", "rtsp")) \
+                and not AUDIO_URL_RE.search(url)
+
+        pic_ex = ThreadPoolExecutor(max_workers=min(16, max(4, threads // 2))) if pictures else None
+        pic_futs: set = set()
+
+        pic_finished: dict[str, object] = {}     # address -> picture already taken
+
+        def queue_picture(uid, extra=None):
+            extra = extra or {}
+            src = (extra.get("pic_url") or by_uid[uid][1], bool(extra.get("pic_hls")))
+            key = norm_url(src[0])
+            self.q.put(("pic_queued",))
+            if key in pic_finished:              # same stream, its picture is already there
+                self.q.put(("picture", uid, pic_finished[key]))
+                return
+            if key in pic_same:                  # same stream as a channel already queued
+                pic_same[key].append(uid)
+                return
+            pic_same[key] = [uid]
+            pic_src[uid] = src
+            pic_futs.add(pic_ex.submit(pic_task, uid))
+
+        def flush_pictures(block: bool):
+            nonlocal pic_futs
+            if not pic_futs:
+                return
+            if block:
+                done, pic_futs = wait(pic_futs, timeout=0.25, return_when=FIRST_COMPLETED)
+            else:
+                done = {f for f in pic_futs if f.done()}
+                pic_futs -= done
+            for f in done:
+                try:
+                    uid, pic = f.result()
+                except Exception:
+                    continue
+                key = norm_url(pic_src[uid][0])
+                pic_finished[key] = pic
+                for same_uid in pic_same.get(key, [uid]):
+                    self.q.put(("picture", same_uid, pic))
+
+        def post(uid, res):
+            self.q.put(("result", uid, res))
+            if wants_picture(uid, res):
+                queue_picture(uid, res[3])
+
+        def run(executor, job_list, chk, on_result):
+            pending = {executor.submit(task, j, chk) for j in job_list}
             while pending and not stop.is_set():  # short waits so "Stop" reacts at once
                 done, pending = wait(pending, timeout=0.25, return_when=FIRST_COMPLETED)
                 for f in done:
@@ -1661,9 +2841,65 @@ class App(tk.Tk):
                         uid, res = f.result()
                     except Exception:
                         continue
-                    self.q.put(("result", uid, res))
+                    on_result(uid, res)
+                flush_pictures(block=False)
+
+        # offline because of a temporary server problem (timeout, HTTP 502/503/504 ...): held back
+        # and checked once more at the end, slower and with a longer time limit
+        held: dict[int, tuple] = {}
+
+        def first_try(uid, res):
+            if retry and res is not None and res[0] == OFFLINE and TEMP_ERROR_RE.search(res[1] or ""):
+                held[uid] = res
+            else:
+                post(uid, res)
+
+        recovered = 0
+
+        def second_try(uid, res):
+            nonlocal recovered
+            first = held.pop(uid)
+            if res is None:
+                post(uid, first)
+                return
+            status, info, ms, extra = res
+            if status == OFFLINE:
+                info = f"{info} (2 tries)" if info == first[1] else f"{info} (2 tries; 1st: {first[1]})"
+            else:
+                recovered += status == ONLINE
+                info = f"{info} · on the 2nd try (1st: {first[1]})"
+            post(uid, (status, info, ms, extra))
+
+        ex = ThreadPoolExecutor(max_workers=threads)
+        rex = None
+        try:
+            if pictures_only:
+                for j in jobs:
+                    queue_picture(j[0])
+            else:
+                run(ex, jobs, checker, first_try)
+                if held and not stop.is_set():
+                    total = len(held)
+                    self.q.put(("retrying", total))
+                    stop.wait(RETRY_PAUSE)
+                    slow = copy.copy(checker)            # same settings, shares the ffmpeg process list
+                    slow.timeout = min(checker.timeout * 2, 120)
+                    rex = ThreadPoolExecutor(max_workers=min(RETRY_THREADS, threads))
+                    run(rex, [by_uid[u] for u in list(held)], slow, second_try)
+                    if not stop.is_set():
+                        self.q.put(("retried", recovered, total))
+            while pic_futs and not stop.is_set():
+                flush_pictures(block=True)
         finally:
+            for uid, res in list(held.items()):  # stopped before the 2nd try: keep the 1st result
+                self.q.put(("result", uid, res))
+            if stop.is_set():
+                checker.kill_all()
             ex.shutdown(wait=False, cancel_futures=True)
+            if rex:
+                rex.shutdown(wait=False, cancel_futures=True)
+            if pic_ex:
+                pic_ex.shutdown(wait=False, cancel_futures=True)
             self.q.put(("done", stop.is_set()))
 
     def stop_check(self):
@@ -1672,34 +2908,70 @@ class App(tk.Tk):
             self.set_status("Stopping the downloads…")
         if self.checking:
             self.stop_event.set()
-            self.set_status("Stopping…")
+            if getattr(self, "_checker", None):
+                self._checker.kill_all()
+            self.set_status("Skipping the rest of the picture check…" if self._pic_phase else "Stopping…")
 
     def _check_finished(self, stopped: bool):
         for c in self.channels:
             if c.status == CHECKING:  # stopped before this one was checked: keep its old result
                 c.status, c.info, c.latency = self._previous.get(c.uid, (UNCHECKED, "", None))
+        self._manual_locked.clear()
         self.checking = False
+        pic_skipped = stopped and self._pic_phase and not self._pictures_only
+        if pic_skipped:
+            stopped = False        # every stream was checked - only the picture check was skipped
+        self.btn_stop.configure(text="■  Stop")
         self.btn_check.state(["!disabled"])
         self.btn_recheck.state(["!disabled"])
         if not self.downloading:
             self.btn_stop.state(["disabled"])
-        self.progress["value"] = self.check_done
+            self.progress["value"] = self.check_done
+        else:                                   # the download owns the bar again
+            d = self._dl
+            self.progress.stop()
+            if d.get("single"):
+                self.progress.configure(mode="indeterminate")
+                self.progress.start(12)
+            else:
+                self.progress.configure(mode="determinate", maximum=max(int(d.get("total", 1)), 1),
+                                        value=int(d.get("done", 0)))
         self.recompute_duplicates()
         self.refresh_all()
         on = sum(c.status == ONLINE for c in self.channels)
         off = sum(c.status == OFFLINE for c in self.channels)
         dups = sum(1 for c in self.channels if c.dup_of)
+        blk = sum(c.status == BLOCKED for c in self.channels)
         text = (f"{'Stopped' if stopped else 'Check finished'}: {on} online · {off} offline · "
-                f"{dups} duplicates · {len(self.channels)} channels total.")
+                f"{blk} geo-blocked · {dups} duplicates · {len(self.channels)} channels total.")
+        if self.pic_total:
+            text += (f" Picture check skipped after {self.pic_done} of {self.pic_total}." if pic_skipped
+                     else f" Pictures checked: {self.pic_done}.")
         skipped = sum(1 for c in self.channels if not self._included(c))
         if skipped:
-            text += f" {skipped} in unticked groups / playlists were not checked."
+            text += f" {skipped} in unticked groups / playlists are not included."
         if self._recheck:
-            back = sum(1 for uid in self._recheck if uid in self.by_uid and self.by_uid[uid].status == ONLINE)
-            text = (f"Recheck {'stopped' if stopped else 'finished'}: {back} of {len(self._recheck)} offline "
-                    f"channels are back online · still offline: {off}.")
+            rechecked = [uid for uid in self._recheck if uid in self.by_uid]
+            back = sum(1 for uid in rechecked if self.by_uid[uid].status == ONLINE)
+            still_off = sum(1 for uid in rechecked if self.by_uid[uid].status == OFFLINE)
+            still_blk = sum(1 for uid in rechecked if self.by_uid[uid].status == BLOCKED)
+            text = (f"Recheck {'stopped' if stopped else 'finished'}: {back} of {len(rechecked)} offline / "
+                    f"blocked channels are back online · still offline: {still_off} · "
+                    f"geo-blocked: {still_blk}.")
             self._recheck = None
+        if self._retry_result:
+            back, tried = self._retry_result
+            text += f" {back} of {tried} channels with a temporary error worked on the 2nd try."
+        self._retrying, self._retry_result = 0, None
+        self._finish_text = text
         self.set_status(text)
+        pictures_taken = bool(self._thumbs)
+        self._pictures_only = False
+        self._pic_phase = False
+        if pictures_taken and not stopped and self.v_geo_ask.get():
+            self.after(300, self._ask_same_picture)
+        else:
+            self._thumbs.clear()
         if self._pending_check and not stopped:
             self._pending_check = False
             if any(c.status == UNCHECKED and self._included(c) for c in self.channels):
@@ -1708,6 +2980,309 @@ class App(tk.Tk):
         self._pending_check = False
         if not stopped:
             self.bell()
+
+    # ------------------------------------------------------------------ geo-blocked channels
+    def _learned(self) -> dict:
+        if not isinstance(self.settings.get("geo_learned"), dict):
+            self.settings["geo_learned"] = {}
+        d = self.settings["geo_learned"]
+        for k in ("pics", "segs", "rejected"):
+            if not isinstance(d.get(k), list):
+                d[k] = []
+
+        def ok(e):     # [fingerprint, brightness, (name), (colour layout)] - skip damaged entries
+            return isinstance(e, list) and len(e) >= 2 and isinstance(e[0], int) and isinstance(e[1], (int, float))
+        d["pics"] = [e for e in d["pics"] if ok(e)]
+        d["rejected"] = [e for e in d["rejected"] if ok(e)]
+        d["segs"] = [e for e in d["segs"] if isinstance(e, str)]
+        return d
+
+    @staticmethod
+    def _entry_colors(e):
+        col = next((x for x in e[2:] if isinstance(x, list)), None)
+        return col if col and all(isinstance(v, int) for v in col) else None
+
+    def _entry_close(self, c: Channel, e) -> bool:
+        return pic_close(c.pic_hash, c.pic_gray, e[0], e[1], c.pic_colors, self._entry_colors(e))
+
+    def _apply_learned(self, c: Channel) -> bool:
+        """Mark a working channel as geo-blocked if it shows a banner the user taught us."""
+        if c.status != ONLINE:
+            return False
+        d = self._learned()
+        if c.seg_hash and c.seg_hash in d["segs"]:
+            c.status, c.info = BLOCKED, "same 'not available' video as a channel you marked"
+            return True
+        if c.pic_hash is not None and c.pic_spread >= PIC_MIN_SPREAD and not is_moving(c):
+            for e in d["pics"]:
+                if self._entry_close(c, e):
+                    name = e[2] if len(e) > 2 and isinstance(e[2], str) else "?"
+                    c.status, c.info = BLOCKED, f"shows the 'not available' banner (like “{name}”)"
+                    return True
+        return False
+
+    def _learn(self, c: Channel) -> bool:
+        d = self._learned()
+        learned = False
+        if c.pic_hash is not None and c.pic_spread >= PIC_MIN_SPREAD:
+            d["rejected"] = [r for r in d["rejected"] if not self._entry_close(c, r)]
+            if not any(self._entry_close(c, e) for e in d["pics"]):
+                d["pics"].append([c.pic_hash, round(c.pic_gray, 1), c.name[:60]] +
+                                 ([c.pic_colors] if c.pic_colors else []))
+                d["pics"] = d["pics"][-300:]
+            learned = True
+        if c.seg_hash:
+            if c.seg_hash not in d["segs"]:
+                d["segs"] = (d["segs"] + [c.seg_hash])[-300:]
+            learned = True
+        return learned
+
+    def _apply_learned_to_all(self) -> int:
+        n = sum(1 for c in self.channels if self._apply_learned(c))
+        if n:
+            self.recompute_duplicates()
+        self.refresh_all()
+        return n
+
+    def mark_blocked(self):
+        sel = self._selected_channels()
+        if not sel:
+            return
+        need_picture = []
+        for c in sel:
+            c.status, c.info = BLOCKED, "marked by you: 'not available in this country'"
+            if self.checking:                 # the running check must not overwrite this mark
+                self._manual_locked.add(c.uid)
+            if not self._learn(c):
+                need_picture.append(c)
+        self.save_settings()
+        others = self._apply_learned_to_all()
+        msg = f"Marked {len(sel)} channel(s) as geo-blocked."
+        if others:
+            msg += f" {others} other channel(s) show the same banner and were marked too."
+        self.set_status(msg)
+        if need_picture:
+            self.ffmpeg = self.ffmpeg or find_ffmpeg()
+            if not self.ffmpeg:
+                messagebox.showinfo(APP_TITLE, "To recognise this banner on other channels the program needs "
+                                    "ffmpeg.\n\nInstall it with:\n    sudo apt install ffmpeg\n\n"
+                                    "The marked channel(s) will be left out when saving.", parent=self)
+                return
+            self.set_status(msg + " Learning the banner picture…")
+            checker = StreamChecker(max(self._int(self.v_timeout, 8), 5), self.v_ua.get().strip(), True,
+                                    self.v_ssl.get(), ffmpeg=self.ffmpeg)
+            self._aux_checkers.add(checker)
+
+            def work(chans=need_picture):
+                try:
+                    for c in chans:
+                        ua, ref = c.http_options()
+                        self.q.put(("learn_pic", c.uid, checker.grab_picture(c.url, ua, ref)))
+                finally:
+                    self._aux_checkers.discard(checker)
+            threading.Thread(target=work, daemon=True).start()
+
+    def _learn_picture_result(self, uid, pic):
+        c = self.by_uid.get(uid)
+        if c is None:
+            return
+        if pic is None or pic[1] < PIC_MIN_SPREAD:
+            self.set_status(f"Could not take a usable picture from “{c.name}” – only this channel is marked.")
+            return
+        c.pic_hash, c.pic_spread, c.pic_gray, _ = pic[:4]
+        c.pic_motion, c.pic_colors = picture_extras(pic)
+        self._learn(c)
+        self.save_settings()
+        n = self._apply_learned_to_all()
+        self.set_status(f"Learned the banner of “{c.name}”." +
+                        (f" {n} other channel(s) show it and were marked as geo-blocked." if n else
+                         " Channels showing it will be marked as geo-blocked in the next checks."))
+
+    def unmark_blocked(self):
+        sel = [c for c in self._selected_channels() if c.status == BLOCKED]
+        if not sel:
+            self.set_status("Select geo-blocked channels first.")
+            return
+        d = self._learned()
+        for c in sel:
+            if c.pic_hash is not None:
+                d["pics"] = [p for p in d["pics"] if not self._entry_close(c, p)]
+                if c.pic_spread >= PIC_MIN_SPREAD:
+                    d["rejected"] = (d["rejected"] + [[c.pic_hash, round(c.pic_gray, 1)] +
+                                                      ([c.pic_colors] if c.pic_colors else [])])[-300:]
+            if c.seg_hash in d["segs"]:
+                d["segs"].remove(c.seg_hash)
+            c.status, c.info = UNCHECKED, ""
+            if self.checking:                 # the running check must not overwrite this change
+                self._manual_locked.add(c.uid)
+        self.save_settings()
+        self.refresh_all()
+        if not self.checking:
+            self.start_check(sel)
+
+    def forget_banners(self):
+        d = self._learned()
+        n = len(d["pics"]) + len(d["segs"])
+        if not messagebox.askyesno(APP_TITLE, f"Forget the {n} learned 'not available' banners?\n"
+                                              "Channels already marked keep their status until the next check.",
+                                   parent=self):
+            return
+        d["pics"], d["segs"], d["rejected"] = [], [], []
+        self.save_settings()
+        self.set_status("Learned banners forgotten.")
+
+    def on_picture_option(self):
+        if self.v_geo_picture.get() and not (self.ffmpeg or find_ffmpeg()):
+            self.v_geo_picture.set(False)
+            messagebox.showinfo(APP_TITLE, "The picture check needs ffmpeg.\n\nInstall it with:\n"
+                                "    sudo apt install ffmpeg\n\nthen switch this option on again.", parent=self)
+        self.ffmpeg = self.ffmpeg or find_ffmpeg()
+        self.save_settings()
+
+    def find_banners(self):
+        self.ffmpeg = self.ffmpeg or find_ffmpeg()
+        if not self.ffmpeg:
+            messagebox.showinfo(APP_TITLE, "The picture check needs ffmpeg.\n\nInstall it with:\n"
+                                "    sudo apt install ffmpeg", parent=self)
+            return
+        targets = [c for c in self.channels if c.status == ONLINE and self._included(c)
+                   and not c.audio and not AUDIO_URL_RE.search(c.url)
+                   and c.url.lower().startswith(("http://", "https://", "rtmp", "rtsp"))]
+        if not targets:
+            messagebox.showinfo(APP_TITLE, "There are no online video channels to check – radio / audio "
+                                "channels are skipped.\nRun “Check streams” first.", parent=self)
+            return
+        self.start_check(targets, pictures_only=True)
+
+    def remove_blocked(self):
+        blk = [c for c in self.channels if c.status == BLOCKED]
+        if not blk:
+            messagebox.showinfo(APP_TITLE, "No geo-blocked channels.", parent=self)
+            return
+        if messagebox.askyesno(APP_TITLE, f"Remove {len(blk)} geo-blocked channels from the list?", parent=self):
+            self._remove(blk)
+            self.set_status(f"Removed {len(blk)} geo-blocked channels.")
+
+    def _same_picture_groups(self):
+        d = self._learned()
+        # a moving picture is live TV - only still pictures can be a banner
+        cands = [c for c in self.channels if c.status == ONLINE and c.pic_hash is not None
+                 and c.pic_spread >= PIC_MIN_SPREAD and not is_moving(c) and self._included(c)]
+        clusters = []  # [hash, gray, members]
+        for c in cands:
+            for cl in clusters:
+                first = cl[2][0]
+                if pic_close(c.pic_hash, c.pic_gray, cl[0], cl[1], c.pic_colors, first.pic_colors):
+                    cl[2].append(c)
+                    break
+            else:
+                clusters.append([c.pic_hash, c.pic_gray, [c]])
+        groups = []
+        for h, g, members in clusters:
+            if count_distinct_channels(members) >= SAME_PICTURE_MIN and \
+                    not any(self._entry_close(members[0], r) for r in d["rejected"]):
+                groups.append((h, g, members))
+        groups.sort(key=lambda x: -len(x[2]))
+        return groups[:6]
+
+    def _ask_same_picture(self):
+        """Several channels show the same picture. A 'not available' banner is a still image, so
+        first take a second picture: if it has changed, it is the same live TV programme
+        (e.g. one channel from several playlists under different names), not a banner."""
+        groups = self._same_picture_groups()
+        if not groups:
+            self._thumbs.clear()
+            return
+        self.ffmpeg = self.ffmpeg or find_ffmpeg()
+        if not self.ffmpeg:
+            self._show_same_picture(groups, 0)
+            return
+        self.set_status(getattr(self, "_finish_text", "") + "   Same picture on several channels – "
+                        "checking whether it is a still banner or live TV …")
+        checker = StreamChecker(max(self._int(self.v_timeout, 8), 5), self.v_ua.get().strip(), True,
+                                self.v_ssl.get(), ffmpeg=self.ffmpeg)
+        self._aux_checkers.add(checker)
+        plan = []
+        for h, g, members in groups:
+            picks, ids = [], set()
+            for m in members:                     # two members that are different channels
+                ident = channel_identity(m)
+                if not ids & {("n", ident[0]), ("i", ident[1])} - {("n", ""), ("i", "")}:
+                    picks.append(m)
+                    ids |= {("n", ident[0]), ("i", ident[1])}
+                if len(picks) == 2:
+                    break
+            jobs = []
+            for m in picks:
+                ua, ref = m.http_options()
+                url, hls = m.pic_src or (m.url, False)
+                jobs.append((url, ua, ref, hls))
+            plan.append((h, g, members, jobs, max(m.pic_time for m in members)))
+
+        def work():
+            kept, live = [], 0
+            try:
+                with ThreadPoolExecutor(max_workers=6) as ex:
+                    for h, g, members, jobs, taken in plan:
+                        wait_s = STILL_CHECK_GAP - (time.monotonic() - taken)
+                        if wait_s > 0:             # live TV needs a moment to show something else
+                            time.sleep(min(wait_s, STILL_CHECK_GAP))
+                        pics = list(ex.map(lambda j: checker.grab_picture(*j), jobs))
+                        cols = members[0].pic_colors
+                        moved = any(p is not None and p[1] >= PIC_MIN_SPREAD and
+                                    ((picture_extras(p)[0] or 0) > PIC_MOVING or
+                                     not pic_close(p[0], p[2], h, g, picture_extras(p)[1], cols))
+                                    for p in pics)
+                        if moved:
+                            live += 1
+                        else:
+                            kept.append((h, g, members))
+                self.q.put(("same_pic_ready", kept, live))
+            finally:
+                self._aux_checkers.discard(checker)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _show_same_picture(self, groups, live: int):
+        if live:
+            self.set_status(getattr(self, "_finish_text", "") +
+                            f"   {live} group(s) of channels showed the same picture, but it changed a few "
+                            "seconds later – the same live programme, not a banner.")
+        if self.checking:                 # a new check started meanwhile: it asks again when it ends
+            return
+        if not live:
+            self.set_status(getattr(self, "_finish_text", ""))
+        groups = [(h, g, ms) for h, g, ms in
+                  ((h, g, [m for m in members if m.status == ONLINE and m.uid in self.by_uid])
+                   for h, g, members in groups)
+                  if count_distinct_channels(ms) >= SAME_PICTURE_MIN]
+        if not groups:
+            self._thumbs.clear()
+            return
+        try:
+            marked = 0
+            for h, g, members in groups:
+                thumb = next((self._thumbs[m.uid] for m in members if m.uid in self._thumbs), None)
+                answer = SamePictureDialog(self, members, thumb, count_distinct_channels(members)).result
+                d = self._learned()
+                first = members[0]
+                cols = [first.pic_colors] if first.pic_colors else []
+                if answer == "block":
+                    for m in members:
+                        m.status, m.info = BLOCKED, "same picture as other channels ('not available' banner)"
+                    # the same picture can't be "a banner" and "not a banner" at the same time
+                    d["rejected"] = [r for r in d["rejected"] if not self._entry_close(first, r)]
+                    d["pics"] = (d["pics"] + [[h, round(g, 1), first.name[:60]] + cols])[-300:]
+                    marked += len(members)
+                elif answer == "not":
+                    d["pics"] = [p for p in d["pics"] if not self._entry_close(first, p)]
+                    d["rejected"] = (d["rejected"] + [[h, round(g, 1)] + cols])[-300:]
+            if groups:
+                self.save_settings()
+                marked += self._apply_learned_to_all()
+                if marked:
+                    self.set_status(f"{marked} channels marked as geo-blocked – they are left out when saving.")
+        finally:
+            self._thumbs.clear()
 
     def _check_added(self):
         """Continue with the playlists that were opened while the previous check was running."""
@@ -1721,10 +3296,29 @@ class App(tk.Tk):
         note = f"   ·   {skipped} unticked skipped" if skipped else ""
         return self._progress_core() + note
 
+    def _time_left(self) -> str:
+        done = self.pic_done - getattr(self, "_pic_phase_done0", 0)
+        elapsed = time.monotonic() - self._pic_phase_start
+        if done < 5 or elapsed < 3:
+            return ""
+        left = (self.pic_total - self.pic_done) * elapsed / done
+        return f" · about {max(1, round(left / 60))} min left" if left >= 60 else f" · about {int(left) + 1} s left"
+
     def _progress_core(self) -> str:
         on = sum(c.status == ONLINE for c in self.channels)
         off = sum(c.status == OFFLINE for c in self.channels)
-        return f"Checking {self.check_done} / {self.check_total}   ·   online {on}   ·   offline {off}"
+        blk = sum(c.status == BLOCKED for c in self.channels)
+        if self._pic_phase:
+            head = "" if self._pictures_only else f"Streams done ✓ ({on} online · {off} offline)   ·   "
+            return (f"{head}Looking for “not available” banners: picture {self.pic_done} / {self.pic_total}"
+                    f"{self._time_left()} · geo-blocked {blk}   –   “Skip pictures” keeps all results")
+        pics = f"   ·   pictures {self.pic_done} / {self.pic_total}" if self.pic_total else ""
+        if self._retrying:
+            left = self.check_total - self.check_done
+            return (f"Trying again: {left} of {self._retrying} channels with a temporary error "
+                    f"(timeout, HTTP 5xx) left   ·   online {on}   ·   offline {off}{pics}")
+        return (f"Checking {self.check_done} / {self.check_total}   ·   online {on}   ·   offline {off}"
+                f"   ·   geo-blocked {blk}{pics}")
 
     def _poll(self):
         updated = False
@@ -1734,36 +3328,61 @@ class App(tk.Tk):
                 kind = msg[0]
                 if kind == "result":
                     c = self.by_uid.get(msg[1])
-                    if c is not None and msg[2] is not None:
-                        c.status, c.info, c.latency = msg[2]
+                    # a channel marked by the user during this check keeps that status
+                    if c is not None and msg[2] is not None and c.uid not in self._manual_locked:
+                        c.status, c.info, c.latency, extra = msg[2]
+                        c.seg_hash = extra.get("seg_hash")
+                        c.audio = bool(extra.get("audio"))
+                        c.pic_src = (extra["pic_url"], bool(extra.get("pic_hls"))) if extra.get("pic_url") \
+                            else None
+                        self._apply_learned(c)
                         self._update_row(c)
                     self.check_done += 1
                     updated = True
+                elif kind == "retrying":
+                    self._retrying = msg[1]
+                    updated = True
+                elif kind == "retried":
+                    self._retrying = 0
+                    self._retry_result = (msg[1], msg[2])
+                    updated = True
+                elif kind == "pic_queued":
+                    self.pic_total += 1
+                    updated = True
+                elif kind == "picture":
+                    c = self.by_uid.get(msg[1])
+                    if c is not None and msg[2] is not None:
+                        c.pic_hash, c.pic_spread, c.pic_gray, thumb = msg[2][:4]
+                        c.pic_motion, c.pic_colors = picture_extras(msg[2])
+                        c.pic_time = time.monotonic()
+                        if c.pic_spread >= PIC_MIN_SPREAD and not is_moving(c):
+                            self._thumbs[c.uid] = thumb   # only a still picture can be a banner
+                        self._apply_learned(c)
+                        self._update_row(c)
+                    self.pic_done += 1
+                    updated = True
+                elif kind == "same_pic_ready":
+                    self._show_same_picture(msg[1], msg[2])
+                elif kind == "learn_pic":
+                    self._learn_picture_result(msg[1], msg[2])
                 elif kind == "done":
                     self._check_finished(msg[1])
-                elif kind == "loaded":
-                    self.progress.stop()
-                    self.progress.configure(mode="determinate", value=0)
-                    self.after_load(self.add_playlist_text(msg[1], msg[2], ""))
-                elif kind == "stream":
-                    self.progress.stop()
-                    self.progress.configure(mode="determinate", value=0)
-                    self.after_load(self.add_stream_urls([msg[1]], msg[1]))
-                    self.set_status("That address is a single TV/radio stream, not a playlist – "
-                                    "it was added as one channel.")
                 elif kind == "dl_item":
                     self._download_item(*msg[1:])
                 elif kind == "dl_done":
                     self._download_finished(msg[1], msg[2])
-                elif kind == "error":
-                    self.progress.stop()
-                    self.progress.configure(mode="determinate", value=0)
-                    self.set_status("Download failed.")
-                    messagebox.showerror(APP_TITLE, msg[1], parent=self)
         except queue.Empty:
             pass
         if updated and self.checking:
-            self.progress["value"] = self.check_done
+            if self.check_done >= self.check_total and self.pic_total > self.pic_done and not self._pic_phase:
+                self._pic_phase = True                     # streams done, only pictures are left
+                self._pic_phase_start = time.monotonic()
+                self._pic_phase_done0 = self.pic_done
+                self.btn_stop.configure(text="■  Skip pictures")
+            if self.check_done >= self.check_total and self.pic_total:
+                self.progress.configure(maximum=max(self.pic_total, 1), value=self.pic_done)
+            else:
+                self.progress["value"] = self.check_done
             self.set_status(self._progress_text())
             now = time.monotonic()
             if now - self._last_group_refresh > 1.0:
@@ -1787,7 +3406,8 @@ class App(tk.Tk):
             info += f" · {c.latency} ms"
         dup = f"{c.dup_reason} as #{c.dup_of}" if c.dup_of else ""
         return (c.uid, STATUS_TEXT[c.status], vis(c.name), vis(c.group or NO_GROUP), vis(info), dup,
-                vis(c.url), vis(self._source_labels.get(c.source, short_source(c.source))))
+                ("▶  " if self.v_click_play.get() else "") + vis(c.url),
+                vis(self._source_labels.get(c.source, short_source(c.source))))
 
     def _included(self, c: Channel) -> bool:
         """In a ticked group and a ticked playlist = will be saved."""
@@ -1807,7 +3427,8 @@ class App(tk.Tk):
     def _source_index(self, src: str) -> int:
         if src not in self.source_color:
             self.source_color[src] = len(self.source_color)
-            self.source_enabled.setdefault(src, True)
+            if src not in self.source_enabled:
+                self.source_enabled[src] = self._initial_source_state(src)
         return self.source_color[src] % len(PLAYLIST_COLORS)
 
     def _source_tag(self, src: str) -> str:
@@ -1847,7 +3468,9 @@ class App(tk.Tk):
             return False
         if show == "Duplicates" and not c.dup_of:
             return False
-        if show.startswith("Problems") and not (c.status == OFFLINE or c.dup_of):
+        if show == "Geo-blocked" and c.status != BLOCKED:
+            return False
+        if show.startswith("Problems") and not (c.status in (OFFLINE, BLOCKED) or c.dup_of):
             return False
         if show.startswith("Good") and not (c.status == ONLINE and not c.dup_of):
             return False
@@ -1882,6 +3505,11 @@ class App(tk.Tk):
         self.refresh_channels()
 
     def refresh_channels(self):
+        if self._search_job:
+            try:
+                self.after_cancel(self._search_job)
+            except tk.TclError:
+                pass
         self._search_job = None
         q = self.v_search.get().strip().casefold()
         show = self.v_show.get()
@@ -1907,8 +3535,70 @@ class App(tk.Tk):
         text = f"Shown: {shown}   ·   Included: {included} of {total}" if included != total else f"Shown: {shown} of {total}"
         self.lbl_shown.configure(text=text)
 
+    # ------------------------------------------------------------------ remembered ticks
+    def _ticks(self) -> dict:
+        if not isinstance(self.settings.get("remembered_ticks"), dict):
+            self.settings["remembered_ticks"] = {}
+        d = self.settings["remembered_ticks"]
+        d.setdefault("groups_off", [])
+        d.setdefault("playlists_off", [])
+        return d
+
+    def _initial_group_state(self, g: str) -> bool:
+        if self.v_remember_ticks.get() and g in self._ticks()["groups_off"]:
+            self._restored_groups.add(g)
+            return False
+        return True
+
+    def _initial_source_state(self, src: str) -> bool:
+        if self.v_remember_ticks.get() and src in self._ticks()["playlists_off"]:
+            self._restored_sources.add(src)
+            return False
+        return True
+
+    def _remember_ticks(self):
+        """Store the ticks of the loaded groups and playlists (others keep what was stored before)."""
+        if not self.v_remember_ticks.get():
+            return
+        d = self._ticks()
+        off_g = set(d["groups_off"])
+        for g, on in self.group_enabled.items():
+            (off_g.discard if on else off_g.add)(g)
+        off_p = set(d["playlists_off"])
+        for src, on in self.source_enabled.items():
+            if src != "clipboard":
+                (off_p.discard if on else off_p.add)(src)
+        d["groups_off"] = sorted(off_g)[-2000:]
+        d["playlists_off"] = sorted(off_p)[-500:]
+        self.save_settings()
+
+    def on_remember_option(self):
+        if self.v_remember_ticks.get():
+            self._remember_ticks()           # also remember the ticks that are set right now
+            self.set_status("Unticked groups and playlists are remembered – also the current ones.")
+        else:
+            self.save_settings()
+            self.set_status("Groups and playlists are no longer remembered – every new playlist starts all ticked.")
+
+    def forget_ticks(self):
+        d = self._ticks()
+        n = len(d["groups_off"]) + len(d["playlists_off"])
+        if not n:
+            messagebox.showinfo(APP_TITLE, "No unticked groups or playlists are remembered.", parent=self)
+            return
+        shown = ", ".join((g or NO_GROUP) for g in d["groups_off"][:12])
+        more = " …" if len(d["groups_off"]) > 12 else ""
+        if not messagebox.askyesno(APP_TITLE, f"Forget {len(d['groups_off'])} remembered unticked group(s) and "
+                                              f"{len(d['playlists_off'])} playlist(s)?\n\n{shown}{more}\n\n"
+                                              "The groups in the list now are not changed.", parent=self):
+            return
+        d["groups_off"], d["playlists_off"] = [], []
+        self.save_settings()
+        self.set_status("Remembered groups and playlists forgotten.")
+
     def _inclusion_changed(self, what: str):
         """A group or playlist was ticked / unticked: update counts, grey rows and the status bar."""
+        self._remember_ticks()
         self.refresh_groups()
         if self.v_show.get().startswith(("Included", "Excluded")) or self.v_hide_excluded.get():
             self.refresh_channels()
@@ -1936,9 +3626,10 @@ class App(tk.Tk):
         for g in stats:
             if g not in self.group_order:
                 self.group_order.append(g)
-                self.group_enabled.setdefault(g, True)
+                if g not in self.group_enabled:
+                    self.group_enabled[g] = self._initial_group_state(g)
         self.group_order = [g for g in self.group_order if g in stats]
-        any_checked = any(c.status in (ONLINE, OFFLINE) for c in self.channels)
+        any_checked = any(c.status in (ONLINE, OFFLINE, BLOCKED) for c in self.channels)
 
         sel = self.gtree.selection()
         self._suppress_group_select = True
@@ -1972,7 +3663,7 @@ class App(tk.Tk):
                 inc_total += 1
                 inc_online += c.status == ONLINE
         self._source_labels = playlist_labels(stats)
-        any_checked = any(c.status in (ONLINE, OFFLINE) for c in self.channels)
+        any_checked = any(c.status in (ONLINE, OFFLINE, BLOCKED) for c in self.channels)
         order = sorted(stats, key=lambda src: self.source_color.get(src, 10 ** 6))
         self._suppress_source_select = True
         self.ptree.delete(*self.ptree.get_children())
@@ -2079,6 +3770,7 @@ class App(tk.Tk):
             self.group_order[self.group_order.index(g)] = new
             self.group_enabled[new] = self.group_enabled.get(g, True)
         self.group_enabled.pop(g, None)
+        self._remember_ticks()
         self.current_group = new
         self.recompute_duplicates()
         self.refresh_all()
@@ -2100,6 +3792,8 @@ class App(tk.Tk):
             if self.cmenu.type(i) != "command":
                 continue
             label = self.cmenu.entrycget(i, "label")
+            if label.startswith("▶ Play"):
+                self.cmenu.entryconfigure(i, label=f"▶ Play in {self._player_label()}")
             if label.startswith("Paste"):
                 state = "normal" if self._clipboard_text().strip() else "disabled"
             elif label.startswith("Recheck all"):
@@ -2119,7 +3813,7 @@ class App(tk.Tk):
             messagebox.showinfo(APP_TITLE, "Select one channel to rename.", parent=self)
             return
         c = sel[0]
-        new = simpledialog.askstring("Rename channel", "Channel name:", initialvalue=c.name, parent=self)
+        new = TextDialog(self, "Rename channel", "Channel name:", c.name).result
         if new and new.strip():
             c.name = new.strip()
             self.recompute_duplicates()
@@ -2139,7 +3833,7 @@ class App(tk.Tk):
         for c in sel:
             c.group = new
         if new not in self.group_enabled:
-            self.group_enabled[new] = True
+            self.group_enabled[new] = self._initial_group_state(new)
             self.group_order.append(new)
         self.refresh_all()
         self.set_status(f"Moved {len(sel)} channel(s) to “{new or NO_GROUP}”.")
@@ -2355,34 +4049,191 @@ class App(tk.Tk):
 
     def play_selected(self):
         sel = self._selected_channels()
-        if not sel:
-            return
-        c = sel[0]
-        url, headers = split_url_headers(c.export_url())
-        player = find_player()
+        if sel:
+            self.play_channel(sel[0])
+
+    # ------------------------------------------------------------------ video player
+    def _col_at(self, x: int) -> str | None:
+        col = self.tree.identify_column(x)
         try:
-            if player:
-                args = [player, url]
-                ua, ref = c.http_options()
-                ua = ua or headers.get("User-Agent") or (self.v_ua.get().strip() if
-                                                        self.v_ua.get().strip() != DEFAULT_UA else None)
-                ref = ref or headers.get("Referer")
-                if "vlc" in Path(player).name.lower():
-                    if ua:
-                        args.append(f":http-user-agent={ua}")
-                    if ref:
-                        args.append(f":http-referrer={ref}")
-                subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                                 stderr=subprocess.DEVNULL, start_new_session=True)
-                self.set_status(f"Playing “{c.name}” in {Path(player).stem}.")
-            else:
-                if sys.platform.startswith("win"):
-                    os.startfile(url)  # type: ignore[attr-defined]
-                else:
-                    webbrowser.open(url)
-                self.set_status("VLC not found – opened with the default program. Install VLC for best results.")
+            i = int(col.lstrip("#"))
+        except ValueError:
+            return None
+        return self.cols[i - 1] if 1 <= i <= len(self.cols) else None
+
+    def on_tree_press(self, e):
+        self._press = (self.tree.identify_row(e.y), e.x, e.y)
+
+    def on_tree_click(self, e):
+        """Single click on the stream address plays the channel."""
+        if not self.v_click_play.get() or e.state & 0x0005:          # not with Shift / Ctrl (multi-select)
+            return
+        if self.tree.identify_region(e.x, e.y) != "cell" or self._col_at(e.x) != "url":
+            return
+        row = self.tree.identify_row(e.y)
+        press = getattr(self, "_press", None)
+        if not press or press[0] != row or abs(press[1] - e.x) > 6 or abs(press[2] - e.y) > 6:
+            return                                                   # a drag, not a click
+        if row and int(row) in self.by_uid:
+            self.tree.selection_set(row)
+            self.play_channel(self.by_uid[int(row)])
+
+    def on_tree_motion(self, e):
+        over = (self.v_click_play.get() and self.tree.identify_region(e.x, e.y) == "cell"
+                and self._col_at(e.x) == "url")
+        want = "hand2" if over else ""
+        if str(self.tree.cget("cursor")) != want:
+            self.tree.configure(cursor=want)
+
+    def _resolve_player(self):
+        """(key, program) of the player to use; key 'system' = default app for .m3u files."""
+        choice = self.v_player.get()
+        if choice == "custom":
+            return ("custom", self.settings.get("player_custom", "")) if self.settings.get("player_custom") else (None, None)
+        if choice == "system":
+            return "system", None
+        if choice != "auto":
+            exe = find_program(choice)
+            return (choice, exe) if exe else (None, None)
+        for key, _, _ in PLAYERS:
+            exe = find_program(key)
+            if exe:
+                return key, exe
+        return "system", None
+
+    def _player_label(self) -> str:
+        key, _ = self._resolve_player()
+        if key == "custom":
+            return "your player"
+        if key == "system":
+            return "the default player"
+        return PLAYER_NAMES.get(key, "player") if key else "player (not installed)"
+
+    def play_channel(self, c: Channel):
+        last_uid, last_t = self._last_play
+        if last_uid == c.uid and time.monotonic() - last_t < 1.5:   # click + double-click = play once
+            return
+        self._last_play = (c.uid, time.monotonic())
+        url, headers = split_url_headers(c.export_url())
+        ua, ref = c.http_options()
+        # a Kodi url|User-Agent=... wins over #EXTVLCOPT, exactly as in the checker
+        ua = header_value(headers, "user-agent") or ua or \
+            (self.v_ua.get().strip() if self.v_ua.get().strip() != DEFAULT_UA else None)
+        ref = header_value(headers, "referer") or ref
+        key, exe = self._resolve_player()
+        if key is None:
+            choice = self.v_player.get()
+            name = PLAYER_NAMES.get(choice, "the chosen player")
+            pkg = {"totem": "totem", "ffplay": "ffmpeg"}.get(choice, choice)
+            messagebox.showinfo(APP_TITLE, f"{name} is not installed.\n\nInstall it with:\n    sudo apt install {pkg}\n\n"
+                                "or choose another one in Settings → Video player.", parent=self)
+            return
+        if self.v_replace_player.get() and self._player_proc and self._player_proc.poll() is None:
+            try:
+                self._player_proc.terminate()
+            except OSError:
+                pass
+        try:
+            if key == "system":
+                self._play_with_default_app(c, url, ua, ref)
+                self.set_status(f"Playing “{c.name}” with the default player for playlists. "
+                                "Install VLC (sudo apt install vlc) or choose one in Settings → Video player.")
+                return
+            cmd = custom_command(exe, url, c.name, ua, ref) if key == "custom" else \
+                player_command(key, exe, url, c.name, ua, ref)
+            self._player_proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                                 stderr=subprocess.DEVNULL, start_new_session=True)
+            self.set_status(f"▶ Playing “{c.name}” in {self._player_label()}.")
         except Exception as e:
-            messagebox.showerror(APP_TITLE, f"Could not start the player:\n{e}", parent=self)
+            messagebox.showerror(APP_TITLE, f"Could not start the player:\n{e}\n\n"
+                                 "Choose another one in Settings → Video player.", parent=self)
+
+    def _play_with_default_app(self, c: Channel, url: str, ua: str | None, ref: str | None):
+        """No known player: a one-channel .m3u opened with the system's default app for playlists."""
+        lines = ["#EXTM3U", f"#EXTINF:-1,{one_line(c.name)}"]
+        lines += [f"#EXTVLCOPT:http-user-agent={one_line(ua)}"] if ua else []
+        lines += [f"#EXTVLCOPT:http-referrer={one_line(ref)}"] if ref else []
+        # the file may contain a login: create it with mkstemp (0600, unpredictable name)
+        now = time.time()
+        for old in Path(tempfile.gettempdir()).glob("playlist-checker-play-*.m3u"):
+            try:
+                if now - old.stat().st_mtime > 24 * 3600:
+                    old.unlink()                 # a player has read it long ago
+            except OSError:
+                pass
+        fd, path = tempfile.mkstemp(prefix="playlist-checker-play-", suffix=".m3u")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines + [one_line(url)]) + "\n")
+            try:
+                os.chmod(path, 0o600)
+            except OSError:
+                pass
+        except Exception:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+            raise
+        if sys.platform.startswith("win"):
+            os.startfile(path)  # type: ignore[attr-defined]
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", path])
+        else:
+            opener = shutil.which("xdg-open")
+            if not opener:
+                raise RuntimeError("no video player found – install VLC:  sudo apt install vlc")
+            subprocess.Popen([opener, path], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True)
+
+    def _fill_player_menu(self, menu: tk.Menu):
+        menu.delete(0, "end")
+        auto_key, _ = (None, None)
+        for key, _, _ in PLAYERS:
+            if find_program(key):
+                auto_key = key
+                break
+        menu.add_radiobutton(label="Automatic" + (f"  ({PLAYER_NAMES[auto_key]})" if auto_key else "  (default app)"),
+                             value="auto", variable=self.v_player, command=self.save_settings)
+        menu.add_separator()
+        for key, name, _ in PLAYERS:
+            installed = bool(find_program(key))
+            menu.add_radiobutton(label=name + ("" if installed else "  – not installed"), value=key,
+                                 variable=self.v_player, command=self.save_settings,
+                                 state="normal" if installed else "disabled")
+        menu.add_radiobutton(label="System default app for playlists", value="system", variable=self.v_player,
+                             command=self.save_settings)
+        menu.add_radiobutton(label="Custom command…", value="custom", variable=self.v_player,
+                             command=self._custom_player)
+        menu.add_separator()
+        menu.add_checkbutton(label="Single click on the stream URL plays it", variable=self.v_click_play,
+                             command=self._on_click_play_option)
+        menu.add_checkbutton(label="Close the previous player when playing another channel",
+                             variable=self.v_replace_player, command=self.save_settings)
+
+    def _custom_player(self):
+        cur = self.settings.get("player_custom", "") or "vlc --fullscreen {url}"
+        val = simpledialog.askstring("Custom video player",
+                                     "Command to play a stream. Placeholders:\n"
+                                     "{url}  stream address    {name}  channel name\n"
+                                     "{ua}  User-Agent    {referer}  Referer\n\n"
+                                     "Example:  mpv --fs --user-agent={ua} {url}",
+                                     initialvalue=cur, parent=self)
+        if val and val.strip():
+            self.settings["player_custom"] = val.strip()
+        elif not self.settings.get("player_custom"):
+            self.v_player.set("auto")
+        self.save_settings()
+
+    def _url_title(self) -> str:
+        return "Stream URL   (click ▶ to play)" if self.v_click_play.get() else "Stream URL"
+
+    def _on_click_play_option(self):
+        self.save_settings()
+        title = self._url_title()
+        self.col_titles["url"] = title
+        self.tree.heading("url", text=title + ((" ▼" if self.sort_rev else " ▲") if self.sort_col == "url" else ""))
+        self.refresh_channels()
 
     # ------------------------------------------------------------------ duplicates
     def recompute_duplicates(self):
@@ -2397,6 +4248,7 @@ class App(tk.Tk):
     def select_for_export(self, o: dict) -> list[Channel]:
         items = [c for c in self.channels
                  if not (o["drop_offline"] and c.status == OFFLINE)
+                 and not (o.get("drop_blocked", True) and c.status == BLOCKED)
                  and not (o["drop_unchecked"] and c.status in (UNCHECKED, CHECKING))
                  and not (o["only_enabled_groups"] and not self.group_enabled.get(c.group, True))
                  and not (o["only_enabled_groups"] and not self.source_enabled.get(c.source, True))]
@@ -2444,15 +4296,26 @@ class App(tk.Tk):
                 by_group: dict[str, list[Channel]] = {}
                 for c in items:
                     by_group.setdefault(c.group, []).append(c)
-                used = set()
+                # the final file names (after date / prefix) must all differ - "News" and
+                # "News_2026-10-24" both become "…News_2026-10-24.m3u8"
+                used, plan = set(), []
                 for g, chans in by_group.items():
-                    base = fname = safe_filename(g or "No group")
-                    n = 2
+                    first = dated_name(safe_filename(g or "No group"), ext,
+                                       self.v_date_names.get(), self.v_prefix_names.get())
+                    fname, n = first, 2
                     while fname.casefold() in used:
-                        fname, n = f"{base} ({n})", n + 1
+                        fname, n = f"{first[:-len(ext) - 1]} ({n}).{ext}", n + 1
                     used.add(fname.casefold())
-                    self._write(os.path.join(folder, dated_name(fname, ext, self.v_date_names.get(),
-                                                                    self.v_prefix_names.get())), chans, ext)
+                    plan.append((os.path.join(folder, fname), chans))
+                existing = [os.path.basename(f) for f, _ in plan if os.path.exists(f)]
+                if existing:
+                    names = "\n".join(f"• {n}" for n in existing[:10])
+                    more = f"\n…and {len(existing) - 10} more" if len(existing) > 10 else ""
+                    if not messagebox.askyesno(APP_TITLE, f"{len(existing)} of these files already exist in the "
+                                               f"folder:\n\n{names}{more}\n\nReplace them?", parent=self):
+                        return
+                for f, chans in plan:
+                    self._write(f, chans, ext)
                 messagebox.showinfo(APP_TITLE, f"Saved {len(by_group)} playlists ({len(items)} channels) to:\n{folder}",
                                     parent=self)
             else:
@@ -2476,8 +4339,13 @@ class App(tk.Tk):
         sources = {c.source for c in self.channels}
         if len(sources) == 1:
             src = next(iter(sources))
+            if src == "clipboard":
+                return ""
             if "://" not in src:
-                return safe_filename(Path(src).stem)
+                name = Path(src).name
+                if name.lower().endswith(".gz"):
+                    name = name[:-3]
+                return safe_filename(Path(name).stem)
         return ""
 
     def _write(self, path, items, ext):
@@ -2503,9 +4371,9 @@ class App(tk.Tk):
                 w = csv.writer(f)
                 w.writerow(["#", "Status", "Check result", "Response ms", "Duplicate", "Channel", "Group", "URL", "Playlist"])
                 for c in self.channels:
-                    w.writerow([c.uid, c.status, c.info, c.latency if c.status == ONLINE else "",
+                    w.writerow([c.uid, c.status, csv_text(c.info), c.latency if c.status == ONLINE else "",
                                 f"{c.dup_reason} as #{c.dup_of}" if c.dup_of else "",
-                                c.name, c.group, c.url, c.source])
+                                csv_text(c.name), csv_text(c.group), csv_text(c.url), csv_text(c.source)])
             self.set_status(f"Report saved: {path}")
         except OSError as e:
             messagebox.showerror(APP_TITLE, f"Could not save:\n{e}", parent=self)
@@ -2589,7 +4457,7 @@ class App(tk.Tk):
             "Type=Application",
             f"Name={APP_TITLE}",
             "Comment=Check IPTV and radio playlists for dead streams and duplicates",
-            f"Exec={desktop_quote(sys.executable)} {desktop_quote(str(script))} %F",
+            f"Exec={desktop_exec_arg(sys.executable)} {desktop_exec_arg(str(script))} %F",
             f"Icon={icon}",
             "Terminal=false",
             "Categories=AudioVideo;Video;",
@@ -2707,11 +4575,18 @@ class App(tk.Tk):
         if self.channels and not messagebox.askyesno(APP_TITLE, "Clear the whole list?", parent=self):
             return
         self.stop_event.set()
+        self._dl_stop.set()
+        self._dl_gen += 1                     # results of downloads still running are ignored
+        self._dl_queue.clear()
         if self.downloading:
-            self._dl_stop.set()
-            self._dl_gen += 1
+            self.downloading = False
+            self.progress.stop()
+            self.progress.configure(mode="determinate")
+            if not self.checking:
+                self.btn_stop.state(["disabled"])
         self.channels.clear()
         self.by_uid.clear()
+        self._manual_locked.clear()
         self.header.clear()
         self.group_enabled.clear()
         self.group_order.clear()
@@ -2732,6 +4607,10 @@ class App(tk.Tk):
             "4. Right-click channels: play in VLC, check again, rename, move to group, delete.\n"
             "5. “Save new playlist” writes a clean playlist (offline and duplicates removed by default). "
             "Logos, EPG (tvg-id, url-tvg) and VLC options are kept.\n\n"
+            "Geo-blocked (⛔): channels that only show “not available in your country”. They are found by the "
+            "server's answer, by short looping videos and – with ffmpeg installed – by the picture. "
+            "Right-click a channel that shows such a banner → “Mark as geo-blocked” and the program "
+            "recognises the same banner on all other channels.\n\n"
             "Tips: some providers block unknown players – keep the VLC User-Agent. "
             "UDP/multicast links can only be tested inside your provider's network."), parent=self)
 
@@ -2811,7 +4690,7 @@ class App(tk.Tk):
     def _int(var: tk.Variable, default: int) -> int:
         try:
             return int(float(var.get()))
-        except (ValueError, tk.TclError):
+        except (ValueError, OverflowError, tk.TclError):
             return default
 
     def save_settings(self):
@@ -2823,11 +4702,27 @@ class App(tk.Tk):
             "hide_hidden": self.v_hide_hidden.get(), "date_names": self.v_date_names.get(),
             "prefix_names": self.v_prefix_names.get(), "auto_check": self.v_auto_check.get(),
             "tint_rows": self.v_tint.get(), "hide_excluded": self.v_hide_excluded.get(),
+            "remember_ticks": self.v_remember_ticks.get(), "player": self.v_player.get(),
+            "player_custom": self.settings.get("player_custom", ""), "click_play": self.v_click_play.get(),
+            "replace_player": self.v_replace_player.get(), "retry_temporary": self.v_retry.get(),
+            "geo_server": self.v_geo_server.get(), "geo_loop": self.v_geo_loop.get(),
+            "geo_picture": self.v_geo_picture.get(), "geo_ask": self.v_geo_ask.get(),
             "bidi_fix": self.v_bidi.get(), "confirm_exit": self.v_confirm_exit.get(),
             "encoding": self.v_encoding.get()})
         try:
             SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
-            SETTINGS_FILE.write_text(json.dumps(self.settings, indent=2, ensure_ascii=False), encoding="utf-8")
+            fd, tmp_name = tempfile.mkstemp(prefix=".settings-", suffix=".json.tmp",
+                                            dir=SETTINGS_FILE.parent)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    f.write(json.dumps(self.settings, indent=2, ensure_ascii=False))
+                os.replace(tmp_name, SETTINGS_FILE)   # atomic: a crash can't leave half a file
+            except OSError:
+                try:
+                    os.unlink(tmp_name)
+                except OSError:
+                    pass
+                raise
         except OSError:
             pass
 
@@ -2843,6 +4738,11 @@ class App(tk.Tk):
             if not messagebox.askyesno(APP_TITLE, question, icon="question", parent=self):
                 return
         self.stop_event.set()
+        self._dl_stop.set()
+        if getattr(self, "_checker", None):
+            self._checker.kill_all()          # don't leave ffmpeg picture processes behind
+        for checker in list(getattr(self, "_aux_checkers", ())):
+            checker.kill_all()
         self.save_settings()
         self.destroy()
 
@@ -2895,8 +4795,12 @@ def main():
         sys.exit(1)
     app.mainloop()
     # stream checks still waiting for a slow server must not keep the process alive after the window closed
-    sys.stdout.flush()
-    sys.stderr.flush()
+    for stream in (sys.stdout, sys.stderr):   # None under pythonw.exe (no console)
+        try:
+            if stream:
+                stream.flush()
+        except (OSError, ValueError):
+            pass
     if threading.active_count() > 1:
         os._exit(0)
 

@@ -10,7 +10,7 @@ Homepage: https://github.com/antoxa78/PyPlaylist-Checker
 Package: playlist-checker
 Architecture: all
 Depends: ${misc:Depends}, python3 (>= 3.9), python3-tk
-Recommends: vlc | mpv, fonts-dejavu-core
+Recommends: vlc | mpv, ffmpeg, fonts-dejavu-core
 Suggests: culmus
 Description: check IPTV and internet radio playlists for dead streams
  Desktop application for TV (IPTV) and internet radio playlists in M3U,
@@ -24,4 +24,7 @@ Description: check IPTV and internet radio playlists for dead streams
  .
  A clean playlist is saved with channel logos, EPG data and player options
  kept, optionally as one playlist per group, together with a CSV report.
- Hebrew and other right-to-left channel names are displayed correctly.
+ Channels that only show a "not available in your country" banner are
+ detected (server answer, looping placeholder, picture fingerprint with
+ ffmpeg) and left out. Hebrew and other right-to-left channel names are
+ displayed correctly.

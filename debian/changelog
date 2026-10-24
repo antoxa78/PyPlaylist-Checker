@@ -1,3 +1,207 @@
+playlist-checker (1.6.2) unstable; urgency=medium
+
+  * Saved playlists are safe against line breaks: newlines in an XSPF
+    title/location or in a pasted channel/group name are kept on one line,
+    so they cannot add channels to the saved file.
+  * A login now survives a redirected playlist's relative links and an
+    http -> https redirect (never another server); default ports compare
+    correctly.
+  * HTTP 200 answers that are JSON/text errors are reported offline
+    (Geo-blocked when they mention the country/region); a normal M3U at a
+    channel address is a playlist, not HLS. HLS is recognised only by a
+    real #EXT-X- tag at the start of a line.
+  * "Mark as geo-blocked" during a running check is no longer overwritten
+    by that check's result; the next check updates it normally.
+  * Learned banners with only two fields (fingerprint and brightness,
+    from older versions) are kept when settings are loaded.
+  * .m3u.gz, .m3u8.gz, .pls.gz and .xspf.gz are found by Open folder, URL
+    lists and the file dialog; default save names no longer keep .gz.
+  * Windows custom-player commands handle quoted paths and arguments.
+  * The picture check skips radio/audio channels (direct audio and
+    audio-only HLS); "Find banners" checks video channels only.
+  * Duplicate detection no longer lowercases the login/password in URLs.
+  * The system-player temporary playlist uses a random name and mode 0600;
+    old ones are removed after a day.
+  * Recheck status counts only the rechecked channels; a check ending
+    during a download gives the progress bar back to the download;
+    "Remember ticks" stores the current ticks when switched on; settings
+    are written atomically with mode 0600; quitting stops ffmpeg picture
+    processes; --option lines are not accepted as channels; pasted
+    channels get a sensible default file name; URL pipe headers win over
+    #EXTVLCOPT in the player, as in the checker.
+  * The program keeps its executable bit.
+
+ -- Anton <anton1978@gmail.com>  Sat, 24 Oct 2026 17:12:39 +0300
+
+playlist-checker (1.6.1) unstable; urgency=medium
+
+  * Addresses with a login (http://user:pass@host/...) work for checks and
+    playlist downloads; the login is not sent on to other servers.
+  * A server's error message (JSON or text) is no longer added as a
+    channel - it is shown in the error message instead.
+  * HLS master playlists: if the first quality does not work, up to 3
+    qualities are tried before a channel is called offline; a UTF-8 BOM
+    no longer makes them fail.
+  * Relative links of a redirected playlist use the address it came from.
+    Kodi style "url|User-Agent=..." works for playlist downloads too.
+  * "Open URL" downloads can be stopped, are cancelled by "Clear list" and
+    wait for running downloads; a second URL list waits instead of being
+    dropped; the Stop button is reset after "Clear list".
+  * Learned banner colours are kept when the program restarts.
+  * "Save new playlist" split by group: two groups can no longer write
+    the same file, and existing files are only replaced after asking;
+    names keep their own date / "Playlist Checker" when those options are
+    off; ~/ paths are saved as full paths.
+  * A local HLS .m3u8 (a stream, not a channel list) is added as one
+    channel; a damaged .m3u.gz is reported as damaged.
+  * An #EXTINF without an address no longer passes its group to the next
+    channel; HTTP errors show their number ("HTTP 404 Not Found").
+  * Hebrew vowel marks (niqqud) and Arabic diacritics stay on their
+    letter; the rename dialog shows Hebrew names the right way round.
+  * Geo-blocked channels count as checked in the group / playlist lists;
+    the URL column title follows the click-to-play option at start.
+  * Less memory: only still pictures keep a thumbnail during a check.
+  * CSV report: names starting with = + - @ are not run as formulas.
+
+ -- Anton <anton1978@gmail.com>  Sat, 24 Oct 2026 15:20:00 +0300
+
+playlist-checker (1.6.0) unstable; urgency=medium
+
+  * Better "not available" banner detection by picture:
+    - up to 3 frames about 0.8 s apart are taken from one download of the
+      stream; a picture that moves (more than 0.6 % of it changes) is live
+      TV and is never taken for a banner, so different names of one live
+      channel, or two TV studios that look alike, are not grouped any more;
+    - a banner that starts with a black frame (fade-in) is now recognised
+      (the first frame that is not plain black is used);
+    - the colours of the picture are compared too, not only its shape and
+      brightness: banners with the same layout but other colours are no
+      longer mixed up. Banners learned from now on keep their colours;
+      banners learned by older versions still work as before.
+  * Speed: ffmpeg is stopped as soon as the picture is seen to move (most
+    channels after the 2nd frame), so the picture check costs about the
+    same time as before. Works with ffmpeg 4.x (-vsync) and 5.1+
+    (-fps_mode).
+  * Damaged learned-banner entries in the settings file are ignored.
+
+ -- Anton <anton1978@gmail.com>  Sat, 24 Oct 2026 13:20:00 +0300
+
+playlist-checker (1.5.4) unstable; urgency=medium
+
+  * Fix: versions of the same channel (e.g. "כאן 11", "כאן 11 HEVC",
+    "כאן 11 כתוביות", "כאן 11 - מקור 2") show the same picture and were
+    taken for a "not available" banner. Names and tvg-ids are now compared
+    without quality, subtitle and source words (HEVC, HD, 4K, subtitles,
+    כתוביות, source / מקור N, backup / גיבוי ...), and such versions count
+    as one channel.
+  * Before asking about the same picture on several channels, a second
+    picture is taken a few seconds later: if it has changed, it is the same
+    live programme (e.g. one channel under different names in several
+    playlists), not a banner, and nothing is asked or marked.
+
+ -- Anton <anton1978@gmail.com>  Sat, 24 Oct 2026 12:40:00 +0300
+
+playlist-checker (1.5.3) unstable; urgency=medium
+
+  * Channels that fail with a temporary server problem (timeout, HTTP 408,
+    429, 500, 502, 503, 504, connection reset) are checked a second time
+    at the end of the check: a few seconds later, fewer at once and with
+    twice the time limit. The check result says "on the 2nd try" or
+    "(2 tries)", and the status bar how many worked on the 2nd try.
+    Settings -> Try again channels with temporary errors (on by default).
+    Permanent errors (404, 403, server not found) are not tried again.
+
+ -- Anton <anton1978@gmail.com>  Sat, 24 Oct 2026 12:10:00 +0300
+
+playlist-checker (1.5.2) unstable; urgency=medium
+
+  * Fix: channels with a long rewind window (e.g. 24 hours, AWS CloudFront /
+    MediaPackage streams) were reported offline with "HLS segment: HTTP 404".
+    Their quality playlists are larger than 1 MB, only part was read and the
+    last, cut-off line was taken for the newest video segment. Playlists up
+    to 16 MB are now read, and when only part arrives in time only complete
+    lines are used.
+
+ -- Anton <anton1978@gmail.com>  Sat, 24 Oct 2026 11:55:00 +0300
+
+playlist-checker (1.5.1) unstable; urgency=medium
+
+  * Fix: the program did not start when the settings file was damaged or had
+    wrong values; such values are now ignored.
+  * Fix: playlists saved as "Unicode" (UTF-16, Windows Notepad) were refused.
+  * Fix: compressed playlists (.m3u.gz, or sent gzip-compressed by a server)
+    were taken for a single stream.
+  * Fix: stream addresses with spaces or non-Latin letters (Cyrillic,
+    Hebrew) were reported offline although players can play them.
+  * Fix: with two or more playlists only the first EPG address was saved;
+    all are now kept (comma-separated).
+  * Fix: a channel with the same address as another one could miss its
+    picture (counter stuck, e.g. "2 / 3").
+  * Fix: with the picture check switched off, an old picture could still mark
+    a channel as geo-blocked.
+  * Fix: with "Deep HLS check" off the picture check used all qualities of
+    a stream (slow); it now uses the lowest one.
+  * Fix: dragging the mouse across stream addresses played a channel.
+  * Faster redraw of big lists when the search is cleared.
+
+ -- Anton <anton1978@gmail.com>  Sat, 24 Oct 2026 11:50:00 +0300
+
+playlist-checker (1.5.0) unstable; urgency=medium
+
+  * A single click on a channel's stream address (shown with ▶, hand cursor)
+    plays it; double-click, Enter and right-click -> Play still work.
+  * Settings -> Video player: Automatic, VLC, mpv, Celluloid, SMPlayer,
+    GNOME Videos, ffplay, the system default app for playlists, or a custom
+    command ({url} {name} {ua} {referer}). The channel's User-Agent and
+    Referer are passed to the player. Options: single click plays, close
+    the previous player when playing another channel.
+  * Without any known player the stream is opened through a one-channel
+    .m3u with the default app instead of the web browser, and a missing
+    chosen player is reported with the install command.
+
+ -- Anton <anton1978@gmail.com>  Sat, 24 Oct 2026 11:25:00 +0300
+
+playlist-checker (1.4.2) unstable; urgency=medium
+
+  * Fix: after all streams were checked ("Checking N / N") the program
+    seemed to hang while it took pictures for the banner check. The picture
+    phase is now much faster (about 10x on provider streams): only the
+    lowest-quality HLS stream and its newest segment are used instead of all
+    qualities, the same address is pictured once, more pictures run in
+    parallel and each has a shorter time limit.
+  * The status bar shows the picture phase with progress and time left, and
+    the Stop button becomes "Skip pictures", which keeps all stream results.
+
+ -- Anton <anton1978@gmail.com>  Sat, 24 Oct 2026 11:05:00 +0300
+
+playlist-checker (1.4.1) unstable; urgency=medium
+
+  * Settings -> Remember ticked / unticked groups and playlists (on by
+    default): groups you untick (by name, in any playlist) and playlists you
+    untick stay unticked the next time they are opened, also after a
+    restart. The status bar says how many were restored. Settings -> Forget
+    remembered groups and playlists clears the memory.
+
+ -- Anton <anton1978@gmail.com>  Sat, 24 Oct 2026 10:50:00 +0300
+
+playlist-checker (1.4.0) unstable; urgency=medium
+
+  * New status "Geo-blocked" for channels that only show "not available in
+    your country": detected from HTTP 451, 403 / web pages mentioning the
+    country or region (English, Russian, Ukrainian, Hebrew), redirects to
+    "geoblock" addresses, and short looping videos instead of live TV.
+  * Picture check with ffmpeg: a fingerprint of one frame per channel; when
+    several channels show the same picture the program shows it and asks.
+    Right-click -> "Mark as geo-blocked" teaches a banner, which is then
+    recognised on all channels (also in later checks); "Not geo-blocked"
+    undoes it. Settings -> Detect geo-blocked channels; Check -> Find "not
+    available" banners in online channels.
+  * Geo-blocked channels are left out when saving (option), can be shown
+    with Show -> Geo-blocked, removed from the list, and are rechecked by
+    Recheck offline. ffmpeg is now a recommended package.
+
+ -- Anton <anton1978@gmail.com>  Sat, 24 Oct 2026 10:40:00 +0300
+
 playlist-checker (1.3.3) unstable; urgency=medium
 
   * Fix: a playlist opened after another one was loaded but could stay

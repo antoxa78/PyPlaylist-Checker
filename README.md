@@ -1,12 +1,11 @@
 # TV & Radio Playlist Checker
 
-Desktop application for IPTV and internet-radio playlists (M3U, M3U8, PLS, XSPF):
-checks every stream, rechecks offline ones, marks duplicates, manages groups and
-saves a clean playlist (logos, EPG and player options kept).
+Desktop application for IPTV and internet-radio playlists (M3U, M3U8, PLS, XSPF,
+also gzip-compressed `.m3u.gz` / `.m3u8.gz`): checks every stream, rechecks offline
+ones, marks duplicates, manages groups and saves a clean playlist (logos, EPG and
+player options kept).
 
 Project page: https://github.com/antoxa78/PyPlaylist-Checker
-
-[![Donate with PayPal](https://img.shields.io/badge/Donate-PayPal-00457C?logo=paypal&logoColor=white)](https://www.paypal.com/paypalme/antoxab1978)
 
 ## Folder contents
 
@@ -25,7 +24,7 @@ Project page: https://github.com/antoxa78/PyPlaylist-Checker
 ## Dependencies
 
 * **Runtime** (installed automatically by apt): `python3 (>= 3.9)`, `python3-tk`
-* **Recommended:** `vlc` or `mpv` (playing channels), `fonts-dejavu-core`
+* **Recommended:** `vlc` or `mpv` (playing channels), `ffmpeg` (finds “not available in your country” banners by the picture), `fonts-dejavu-core`
 * **Optional:** `culmus` (extra Hebrew fonts)
 * **To build:** `dpkg-dev` (method 1), or `debhelper` + `dpkg-dev` (method 2);
   `lintian` to check the package
@@ -41,7 +40,7 @@ sudo apt install dpkg-dev          # usually already installed
 ./build-deb.sh
 ```
 
-Result: `dist/playlist-checker_1.3.3_all.deb`
+Result: `dist/playlist-checker_1.6.2_all.deb`
 
 ### Method 2 – standard Debian tools
 
@@ -50,12 +49,12 @@ sudo apt install debhelper dpkg-dev
 dpkg-buildpackage -us -uc -b
 ```
 
-Result: `../playlist-checker_1.3.3_all.deb`
+Result: `../playlist-checker_1.6.2_all.deb`
 
 ## Install / remove
 
 ```sh
-sudo apt install ./dist/playlist-checker_1.3.3_all.deb
+sudo apt install ./dist/playlist-checker_1.6.2_all.deb
 playlist-checker                    # or find it in the applications menu
 sudo apt remove playlist-checker
 ```
@@ -69,9 +68,3 @@ User settings are kept in `~/.config/playlist-checker/settings.json`.
 2. Add an entry at the top of `debian/changelog` with the same version
    (`dch -v 1.0.1` or by hand, keeping the exact format).
 3. Run `./build-deb.sh` – it refuses to build if the two versions differ.
-
-## Support the project
-
-If this program is useful to you, you can support its development with a donation:
-
-[![Donate with PayPal](https://www.paypalobjects.com/en_US/i/btn/btn_donateCC_LG.gif)](https://www.paypal.com/paypalme/antoxab1978)
