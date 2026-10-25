@@ -26,5 +26,8 @@ Description: check IPTV and internet radio playlists for dead streams
  kept, optionally as one playlist per group, together with a CSV report.
  Channels that only show a "not available in your country" banner or a
  black screen are detected (server answer, looping placeholder, picture
- fingerprint with ffmpeg) and left out. Hebrew and other right-to-left
- channel names are displayed correctly.
+ fingerprint with ffmpeg) and left out. A Quality column shows resolution,
+ codec, frame rate and bitrate; changes can be undone and redone, the window
+ has light and dark themes, and check results can be remembered between
+ sessions. Hebrew and other right-to-left channel names are displayed
+ correctly.

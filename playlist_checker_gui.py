@@ -65,7 +65,7 @@ import tkinter.font as tkfont
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 APP_TITLE = "TV & Radio Playlist Checker"
-APP_VERSION = "1.6.5"
+APP_VERSION = "1.7.0"
 PROJECT_URL = "https://github.com/antoxa78/PyPlaylist-Checker"
 DEFAULT_UA = "VLC/3.0.20 LibVLC/3.0.20"
 # Settings -> User-Agent. Some IPTV providers only answer certain players/apps.
@@ -110,6 +110,9 @@ def user_agent_name(ua: str) -> str:
     return "custom"
 CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "playlist-checker"
 SETTINGS_FILE = CONFIG_DIR / "settings.json"
+RESULTS_FILE = CONFIG_DIR / "results.json"      # Settings -> Remember check results between sessions
+RESULTS_MAX = 50_000          # remembered streams (the oldest results are dropped first)
+RESULTS_MAX_DAYS = 180        # results older than this are forgotten
 OLD_SETTINGS_FILE = Path.home() / ".playlist_checker_gui.json"  # used by earlier versions
 # installed as a system package (deb) -> the menu entry already exists
 INSTALLED = str(Path(__file__).resolve()).startswith(("/usr/", "/opt/"))
@@ -126,11 +129,17 @@ def is_playlist_name(name: str) -> bool:
 
 
 NO_GROUP = "(no group)"
+UNDO_MAX_STEPS = 30           # Edit -> Undo remembers this many changes ...
+UNDO_MAX_CHANNELS = 300_000   # ... but not more channel copies than this in all (huge playlists)
+# what a check found out about a channel: an undo keeps the newest of these (it does not "un-check")
+CHECK_FIELDS = ("status", "info", "latency", "seg_hash", "audio", "quality", "pic_hash", "pic_spread", "pic_gray",
+                "pic_motion", "pic_colors", "pic_src", "pic_time", "checked_at", "remembered", "prev_status",
+                "prev_time", "checked_ua")
 LAUNCHER_ID = "playlist-checker"
-# physical key codes of A, C, V, X: Ctrl+C/V/X/A must also work while a Hebrew or
+# physical key codes of A, C, V, X, Y, Z: Ctrl+A/C/V/X/Z/Y must also work while a Hebrew or
 # Russian keyboard layout is active (Tk on Linux sees "hebrew_bet", not "c")
-KEYCODE_LETTERS = {"x11": {38: "a", 54: "c", 55: "v", 53: "x"},
-                   "win32": {65: "a", 67: "c", 86: "v", 88: "x"}}
+KEYCODE_LETTERS = {"x11": {38: "a", 54: "c", 55: "v", 53: "x", 52: "z", 29: "y"},
+                   "win32": {65: "a", 67: "c", 86: "v", 88: "x", 90: "z", 89: "y"}}
 TEXT_FIELD_CLASSES = ("Entry", "TEntry", "TCombobox", "Spinbox", "TSpinbox")
 STREAM_URL_RE = re.compile(r"^\s*(?:https?|rtmpe?|rtmps|rtmpt|rtsps?|mmsh?|mmst|udp|rtp|srt)://\S+", re.I)
 AUDIO_URL_RE = re.compile(r"\.(?:mp3|aac|ogg|oga|opus|flac|m4a|m4b|wav|wma)(?:$|[?|])", re.I)
@@ -140,6 +149,9 @@ BLOCKED = "blocked"   # answers, but "not available in your country" / placehold
 STATUS_TEXT = {ONLINE: "● Online", OFFLINE: "✖ Offline", UNCHECKED: "○ Not checked", CHECKING: "… Checking",
                BLOCKED: "⛔ Geo-blocked"}
 STATUS_RANK = {ONLINE: 0, UNCHECKED: 1, CHECKING: 1, OFFLINE: 2, BLOCKED: 2}
+FINAL_STATUSES = (ONLINE, OFFLINE, BLOCKED)     # results worth remembering / comparing
+STATUS_WORD = {ONLINE: "online", OFFLINE: "offline", BLOCKED: "geo-blocked"}
+SHOW_CHANGED = "Changed since the last check"
 
 # ---- "not available in your country" detection
 # addresses a server redirects to, or takes the video from, when a channel is blocked
@@ -182,7 +194,7 @@ TCP_PORTS = {"rtmp": 1935, "rtmpe": 1935, "rtmpt": 80, "rtmps": 443, "rtsp": 554
              "mms": 1755, "mmst": 1755, "mmsh": 80}
 NOT_CHECKABLE = {"udp", "rtp", "igmp", "srt", "acestream", "magnet", "p2p", "sop"}
 
-SHOW_OPTIONS = ["All", "Online", "Offline", "Geo-blocked", "Not checked", "Duplicates",
+SHOW_OPTIONS = ["All", "Online", "Offline", "Geo-blocked", "Not checked", "Duplicates", SHOW_CHANGED,
                 "Problems (offline, blocked, duplicates)", "Good (online, unique)",
                 "Included (will be saved)", "Excluded (unticked)"]
 
@@ -228,6 +240,17 @@ class Channel:
     pic_src: tuple | None = None  # (address ffmpeg used for the picture, is HLS)
     pic_time: float = 0.0         # when the picture was taken (time.monotonic)
     audio: bool = False           # the last check found audio, not video (no picture check)
+    quality: dict | None = None   # resolution, codec, frame rate, bitrate (see quality_text)
+    checked_at: float = 0.0       # when the shown result was found (time.time(); 0 = never)
+    remembered: bool = False      # the result comes from an earlier session (not checked now)
+    checked_ua: str | None = None  # Settings User-Agent the shown result was found with (None: not known)
+    prev_status: str | None = None   # result before the latest check (to show what changed)
+    prev_time: float = 0.0
+
+    @property
+    def changed(self) -> bool:
+        """The latest check gave another result than the check before it (this or an earlier session)."""
+        return self.prev_status is not None and self.status in FINAL_STATUSES and self.status != self.prev_status
 
     def http_options(self) -> tuple[str | None, str | None]:
         """User-Agent and Referer the playlist asks for, if any."""
@@ -251,6 +274,29 @@ class Channel:
         if not os.path.isabs(p) and self.base_dir:
             return os.path.normpath(os.path.join(self.base_dir, p))
         return p
+
+    def result_key(self, global_ua: str = "") -> str:
+        """Where the remembered check result of this channel is kept: the stream address plus the
+        headers the check sends with it (a server may answer another User-Agent or Referer
+        differently), the same way the checker picks them: Kodi 'url|User-Agent=…' first, then
+        #EXTVLCOPT / attributes, then the User-Agent of Settings. Relative local paths are resolved,
+        so "stream.ts" in two different folders does not share one result. The key is a hash, so
+        results.json holds no stream addresses or logins."""
+        if is_local(self.url):
+            return result_hash(norm_url(self.export_url()))
+        base, extra = split_url_headers(self.url.strip())
+        ua, ref = self.http_options()
+        headers = {k.strip().lower(): v for k, v in extra.items()}
+        ua = headers.pop("user-agent", None) or ua or (global_ua or "").strip() or DEFAULT_UA
+        ref = headers.pop("referer", None) or ref
+        if ua != DEFAULT_UA:              # the default adds nothing: keys of plain streams stay short
+            headers["user-agent"] = ua
+        if ref:
+            headers["referer"] = ref
+        key = norm_url(base)
+        if headers:
+            key += "|" + "&".join(f"{k}={v}" for k, v in sorted(headers.items()))
+        return result_hash(key)
 
 
 def is_local(url: str) -> bool:
@@ -742,6 +788,91 @@ def hls_variants(text: str) -> list[tuple[str, bool]]:
     return result
 
 
+# ---------------------------------------------------------------- stream quality
+VIDEO_CODECS = (("avc", "H.264"), ("h264", "H.264"), ("hvc", "H.265"), ("hev", "H.265"), ("h265", "H.265"),
+                ("vp09", "VP9"), ("vp9", "VP9"), ("av01", "AV1"), ("av1", "AV1"), ("mpeg2", "MPEG-2"),
+                ("mp4v", "MPEG-4"), ("mpeg4", "MPEG-4"), ("vp8", "VP8"))
+AUDIO_TYPES = {"audio/mpeg": "MP3", "audio/mp3": "MP3", "audio/aac": "AAC", "audio/aacp": "AAC+",
+               "audio/x-aac": "AAC", "audio/mp4": "AAC", "audio/ogg": "Ogg", "application/ogg": "Ogg",
+               "audio/opus": "Opus", "audio/flac": "FLAC", "audio/x-flac": "FLAC", "audio/wav": "WAV",
+               "audio/x-wav": "WAV", "audio/x-ms-wma": "WMA"}
+
+
+def codec_name(text: str) -> str:
+    low = (text or "").lower()
+    return next((name for key, name in VIDEO_CODECS if key in low), "")
+
+
+def hls_master_quality(text: str) -> dict | None:
+    """Best video quality offered by an HLS master playlist (from its #EXT-X-STREAM-INF lines)."""
+    best, count = None, 0
+    for ln in text.splitlines():
+        ln = ln.strip()
+        if not ln.upper().startswith("#EXT-X-STREAM-INF"):
+            continue
+        codecs = (re.search(r'CODECS="([^"]*)"', ln, re.I) or [None, ""])[1]
+        if codecs and not re.search(r"avc|hvc|hev|vp0?9|av01|mp4v", codecs, re.I):
+            continue                                   # audio-only variant
+        count += 1
+        res = re.search(r"RESOLUTION=(\d+)x(\d+)", ln, re.I)
+        bw = re.search(r"(?<![-A-Z])BANDWIDTH=(\d+)", ln, re.I)
+        fps = re.search(r"FRAME-RATE=([\d.]+)", ln, re.I)
+        q = {"w": int(res.group(1)) if res else 0, "h": int(res.group(2)) if res else 0,
+             "codec": codec_name(codecs), "fps": float(fps.group(1)) if fps else 0.0,
+             "bw": int(bw.group(1)) if bw else 0, "src": "hls"}
+        if best is None or (q["h"], q["bw"]) > (best["h"], best["bw"]):
+            best = q
+    if best:
+        best["variants"] = count
+    return best
+
+
+def ffmpeg_video_quality(err: bytes) -> dict | None:
+    """Resolution, codec, frame rate from ffmpeg's line 'Stream #0:0: Video: h264 (High), …, 1920x1080, 25 fps'."""
+    text = (err or b"").decode("utf-8", "ignore")
+    m = re.search(r"Stream #\d+:\d+.*?: Video: ([^\n]*)", text)
+    if not m:
+        return None
+    line = m.group(1)
+    res = re.search(r"\b(\d{2,5})x(\d{2,5})\b", line)
+    fps = re.search(r"([\d.]+) fps", line)
+    if not res:
+        return None
+    return {"w": int(res.group(1)), "h": int(res.group(2)), "codec": codec_name(line.split(",")[0]),
+            "fps": float(fps.group(1)) if fps else 0.0, "bw": 0, "src": "ffmpeg"}
+
+
+def quality_text(q: dict | None) -> str:
+    """'1080p · H.264 · 25 fps · 5.0 Mb/s' or 'audio · MP3 · 128 kb/s'."""
+    if not q:
+        return ""
+    if q.get("audio"):
+        parts = ["audio"] + ([q["audio"]] if q["audio"] != "audio" else [])
+        if q.get("bw"):
+            parts.append(f"{q['bw'] // 1000} kb/s")
+        return " · ".join(parts)
+    parts = []
+    if q.get("h"):
+        parts.append(f"{q['h']}p")
+    if q.get("codec"):
+        parts.append(q["codec"])
+    if q.get("fps"):
+        parts.append(f"{q['fps']:.2f}".rstrip("0").rstrip(".") + " fps")
+    if q.get("bw"):
+        bw = q["bw"]
+        parts.append(f"{bw / 1e6:.1f} Mb/s" if bw >= 1_000_000 else f"{bw // 1000} kb/s")
+    return " · ".join(parts)
+
+
+def quality_rank(q: dict | None) -> tuple:
+    """Sort order of the Quality column: no information first, then radio, then video by height and bitrate."""
+    if not q:
+        return (0, 0, 0)
+    if q.get("audio"):
+        return (1, 0, q.get("bw", 0))
+    return (2, q.get("h", 0), q.get("bw", 0))
+
+
 # ---------------------------------------------------------------- playlist downloads / URL lists
 DOWNLOAD_PARALLEL = 4
 URL_IN_LINE_RE = re.compile(r"([a-z][a-z0-9+.\-]*://[^\s\"'<>]+)", re.I)
@@ -1149,6 +1280,10 @@ class StreamChecker:
             with opener.open(req, timeout=self.timeout) as r:
                 code = r.status
                 ctype = (r.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+                try:      # Icecast / Shoutcast tell the bitrate (kb/s), sometimes as "128,128"
+                    icy_br = int((r.headers.get("icy-br") or "0").split(",")[0].strip() or 0)
+                except ValueError:
+                    icy_br = 0
                 final_url = r.geturl()
                 deadline = time.monotonic() + self.timeout
                 # some servers send an HLS playlist gzip-compressed even without Accept-Encoding;
@@ -1220,6 +1355,10 @@ class StreamChecker:
             if not uris:
                 return OFFLINE, f"HTTP {code} · HLS playlist is empty"
             self._note_picture_source(text, final_url)
+            if "#EXT-X-STREAM-INF" in text and self._extra is not None and "quality" not in self._extra:
+                q = hls_master_quality(text)
+                if q:
+                    self._note(quality=q)
             variants = hls_variants(text) if "#EXT-X-STREAM-INF" in text else []
             if variants and all(not video for _, video in variants):
                 self._note(audio=True)          # an HLS radio playlist: no video to fingerprint
@@ -1273,7 +1412,7 @@ class StreamChecker:
         if depth > 0:
             self._note(seg_hash=hashlib.sha1(data[:65536]).hexdigest())
         if ctype.startswith("audio/") or ctype in ("application/ogg",):
-            self._note(audio=True)
+            self._note(audio=True, quality={"audio": AUDIO_TYPES.get(ctype, "audio"), "bw": icy_br * 1000})
         return ONLINE, f"HTTP {code}" + (f" · {ctype}" if ctype else "")
 
     # ------------------------------------------------------------------ picture (ffmpeg)
@@ -1284,7 +1423,8 @@ class StreamChecker:
         much of the picture changes between the frames (None when only one frame came)."""
         if not self.ffmpeg:
             return None
-        cmd = self._ffmpeg_input(url, ua, referer, hls) + [
+        # log level "info": ffmpeg then also prints the stream line (resolution, codec, fps) for Quality
+        cmd = [("info" if a == "error" else a) for a in self._ffmpeg_input(url, ua, referer, hls)] + [
             "-map", "0:v:0",
             "-vf", f"select='eq(n\\,0)+gte(t-prev_selected_t\\,{PIC_FRAME_GAP})',scale={PIC_W}:{PIC_H}"]
         tail = ["-frames:v", str(PIC_FRAMES), "-f", "image2pipe", "-vcodec", "ppm", "-"]
@@ -1301,11 +1441,13 @@ class StreamChecker:
 
         fps_args = ffmpeg_passthrough_args(self.ffmpeg)
         frames, err = self._read_frames(cmd + fps_args + tail, enough)
-        if not frames and re.search(rb"Unrecognized option|Option not found|not supported", err or b""):
+        if not frames and re.search(rb"(?:Unrecognized option|not supported)[^\n]*(?:fps_mode|vsync)|"
+                                    rb"(?:fps_mode|vsync)[^\n]*not supported|Option not found", err or b""):
             fps_args = ["-vsync", "0"] if fps_args[0] == "-fps_mode" else ["-fps_mode", "passthrough"]
             _FFMPEG_FPS_ARGS[self.ffmpeg] = fps_args
             prints.clear()
             frames, err = self._read_frames(cmd + fps_args + tail, enough)
+        self._tls.video_quality = ffmpeg_video_quality(err)
         if not frames:
             return None
         enough(frames)
@@ -1403,9 +1545,13 @@ class StreamChecker:
                 pass
             with self._procs_lock:
                 self._procs.discard(proc)
-        if not frames:
-            err_reader.join(2)           # the error text decides whether to retry
+        # the error text decides whether to retry; with frames it still holds the stream line (quality)
+        err_reader.join(2 if not frames else 0.5)
         return frames, b"".join(x for x in err if x)
+
+    def video_quality(self) -> dict | None:
+        """Resolution / codec / frame rate ffmpeg reported during this thread's last grab_picture()."""
+        return getattr(self._tls, "video_quality", None)
 
     def kill_all(self):
         with self._procs_lock:
@@ -1429,6 +1575,22 @@ def norm_url(url: str) -> str:
         netloc = (userinfo + at if at else "") + hostport.lower()
         u = urllib.parse.urlunsplit((p.scheme.lower(), netloc, p.path, p.query, ""))
     return u.rstrip("/")
+
+
+def result_hash(key: str) -> str:
+    """Remembered results are stored under a hash of the address, not the address itself:
+    results.json then shows no stream addresses, logins (user:pass@) or tokens."""
+    return hashlib.sha256(("playlist-checker results\0" + key).encode("utf-8", "surrogatepass")).hexdigest()[:32]
+
+
+def current_status(c) -> str:
+    """The status to act on (remove offline, keep one of the duplicates, leave out of a saved
+    playlist). An online / offline result from an earlier session may be months old, so it counts
+    as not checked. A geo-block is kept: it depends on your country rather than on the stream,
+    and it is often your own mark."""
+    if getattr(c, "remembered", False) and c.status in (ONLINE, OFFLINE):
+        return UNCHECKED
+    return c.status
 
 
 def norm_name(name: str, ignore_quality: bool) -> str:
@@ -1474,7 +1636,8 @@ def count_distinct_channels(members) -> int:
 def find_duplicates(channels: list[Channel], by_url: bool, by_name: bool,
                     ignore_quality: bool) -> dict[int, tuple[int, str]]:
     """{uid of duplicate: (uid of the copy that is kept, reason)}.
-    The copy that is kept: online first, then the one that appears first."""
+    The copy that is kept: online first, then the one that appears first. A result from an earlier
+    session counts as not checked (current_status), so a months-old "offline" never loses a stream."""
     dups: dict[int, tuple[int, str]] = {}
 
     def run(keyfunc, reason):
@@ -1483,7 +1646,7 @@ def find_duplicates(channels: list[Channel], by_url: bool, by_name: bool,
             if c.uid not in dups:
                 k = keyfunc(c)
                 if k:
-                    buckets[k].append((STATUS_RANK.get(c.status, 1), idx, c))
+                    buckets[k].append((STATUS_RANK.get(current_status(c), 1), idx, c))
         for items in buckets.values():
             if len(items) > 1:
                 items.sort(key=lambda x: (x[0], x[1]))
@@ -1747,12 +1910,13 @@ def desktop_exec_arg(arg: str) -> str:
 
 SETTING_TYPES = {
     "timeout": (int, float), "threads": (int, float), "user_agent": str, "player": str, "player_custom": str,
-    "encoding": str, "last_dir": str, "export": dict, "geo_learned": dict, "remembered_ticks": dict,
+    "encoding": str, "last_dir": str, "theme": str, "export": dict, "geo_learned": dict,
+    "remembered_ticks": dict,
 }
 BOOL_SETTINGS = ("deep_hls", "ignore_ssl", "dup_url", "dup_name", "dup_quality", "hide_hidden", "date_names",
                  "prefix_names", "bidi_fix", "confirm_exit", "auto_check", "tint_rows", "hide_excluded",
                  "remember_ticks", "geo_server", "geo_loop", "geo_picture", "geo_ask", "click_play",
-                 "replace_player", "retry_temporary", "black_screen")
+                 "replace_player", "retry_temporary", "black_screen", "remember_results")
 
 
 def clean_settings(data: dict) -> dict:
@@ -1788,6 +1952,82 @@ def clean_settings(data: dict) -> dict:
     return out
 
 
+def age_text(seconds: float) -> str:
+    """'just now', '5 min ago', '3 h ago', '2 days ago', '3 weeks ago', '4 months ago'."""
+    s = max(0, int(seconds))
+    if s < 60:
+        return "just now"
+    if s < 3600:
+        return f"{s // 60} min ago"
+    if s < 86400:
+        return f"{s // 3600} h ago"
+    days = s // 86400
+    if days < 14:
+        return "1 day ago" if days == 1 else f"{days} days ago"
+    if days < 60:
+        return f"{days // 7} weeks ago"
+    return f"{days // 30} months ago"
+
+
+def quality_dict_ok(q) -> bool:
+    """Is this the quality part of a remembered result - or None? (the file may be hand-edited)"""
+    if q is None:
+        return True
+    if not isinstance(q, dict):
+        return False
+    for k in ("w", "h", "bw", "fps", "variants"):
+        if k in q and (not isinstance(q[k], (int, float)) or isinstance(q[k], bool)):
+            return False                   # quality_text / quality_rank would fail on these
+    for k in ("codec", "audio", "src"):
+        if k in q and not isinstance(q[k], str):
+            return False
+    return True
+
+
+def load_results() -> dict:
+    """Remembered check results: result_key() hash -> [status, info, ms, quality, time].
+    A version 1 file (keys were plain stream addresses) is converted and rewritten at once."""
+    try:
+        data = json.loads(RESULTS_FILE.read_text("utf-8"))
+        items = data.get("results", {}) if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+    hashed = isinstance(data, dict) and data.get("version") == 2
+    oldest = time.time() - RESULTS_MAX_DAYS * 86400
+    out = {}
+    for url, e in items.items() if isinstance(items, dict) else ():
+        # skip damaged / hand-edited entries instead of failing
+        if (isinstance(url, str) and isinstance(e, list) and len(e) >= 5 and e[0] in FINAL_STATUSES
+                and isinstance(e[1], str) and (e[2] is None or isinstance(e[2], int))
+                and quality_dict_ok(e[3]) and isinstance(e[4], (int, float)) and e[4] >= oldest):
+            out[url if hashed else result_hash(url)] = e[:5]
+    if not hashed and items:
+        save_results(out)                  # no plain addresses / logins left on disk
+    return out
+
+
+def save_results(results: dict) -> None:
+    if len(results) > RESULTS_MAX:      # keep the newest
+        keep = sorted(results.items(), key=lambda kv: kv[1][4])[-RESULTS_MAX:]
+        results.clear()
+        results.update(keep)
+    try:
+        RESULTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(prefix=".results-", suffix=".json.tmp", dir=RESULTS_FILE.parent)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump({"version": 2, "results": results}, f, ensure_ascii=False, separators=(",", ":"))
+            os.replace(tmp_name, RESULTS_FILE)      # atomic: a crash can't leave half a file
+        except OSError:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+            raise
+    except OSError:
+        pass
+
+
 def load_settings() -> dict:
     for f in (SETTINGS_FILE, OLD_SETTINGS_FILE):
         try:
@@ -1797,6 +2037,258 @@ def load_settings() -> dict:
         except Exception:
             continue
     return {}
+
+
+# =============================================================================
+#  Look (colours of the light theme drawn on top of ttk "clam" on Linux)
+# =============================================================================
+
+THEMES = {
+    "light": {
+        "bg": "#f3f4f6",          # window background
+        "surface": "#ffffff",     # lists, tables, text fields
+        "header": "#eceef2",      # table headings
+        "border": "#d3d7de",
+        "border_strong": "#b9bfc9",
+        "text": "#1f2328",
+        "muted": "#5f6b7a",
+        "disabled": "#9aa2ad",
+        "accent": "#2f6fdb",
+        "accent_hover": "#285fc0",
+        "accent_pressed": "#2252a6",
+        "accent_soft": "#c3d6f6",  # selected row of a list without keyboard focus
+        "accent_disabled": "#a9c1ec",
+        "accent_disabled_text": "#eef3fc",
+        "on_accent": "#ffffff",    # text on the accent colour
+        "hover": "#e8ebf0",
+        "pressed": "#dce0e7",
+        "thumb": "#c4c9d2",
+        "thumb_hover": "#a7aeb9",
+        "link": "#1f5fc4",
+        "link_hover": "#143f86",
+        # channel table: status colours (readable on the surface and on the playlist tints)
+        "status": {ONLINE: "#1a7f37", OFFLINE: "#cf222e", BLOCKED: "#8250df", CHECKING: "#0969da",
+                   UNCHECKED: "#57606a"},
+        "excluded": "#a3aab4",
+        "dup_bg": "#fff3c4",
+        "tint": 0.0,               # 0: the light tints of PLAYLIST_COLORS
+    },
+    "dark": {
+        "bg": "#1d1f23",
+        "surface": "#25282d",
+        "header": "#2c3036",
+        "border": "#3a3f47",
+        "border_strong": "#4b515b",
+        "text": "#e4e7eb",
+        "muted": "#9aa3ad",
+        "disabled": "#646b75",
+        "accent": "#3b7be4",
+        "accent_hover": "#4a88ec",
+        "accent_pressed": "#2d64c2",
+        "accent_soft": "#2a426b",
+        "accent_disabled": "#2b3d5c",
+        "accent_disabled_text": "#8496b3",
+        "on_accent": "#ffffff",
+        "hover": "#31353c",
+        "pressed": "#3a3f47",
+        "thumb": "#4b515b",
+        "thumb_hover": "#5f6671",
+        "link": "#79aaf7",
+        "link_hover": "#a8c8fb",
+        "status": {ONLINE: "#4ac26b", OFFLINE: "#ff6b62", BLOCKED: "#b98dfa", CHECKING: "#5aa9ff",
+                   UNCHECKED: "#8b949e"},
+        "excluded": "#5f666f",
+        "dup_bg": "#3f3a1c",
+        "tint": 0.14,              # playlist tints: this much of the playlist colour on the surface
+    },
+}
+THEME_CHOICES = (("auto", "Same as the system"), ("light", "Light"), ("dark", "Dark"))
+UI = dict(THEMES["light"])      # the colours in use; changed in place by App._apply_theme
+THEMED = {"on": False}          # True while the colours above are drawn (ttk "clam")
+
+
+def system_prefers_dark() -> bool:
+    """Does the desktop use a dark colour scheme? (GNOME / Cinnamon / MATE / KDE, Windows, macOS)"""
+    def run(cmd) -> str:
+        try:
+            return subprocess.run(cmd, capture_output=True, text=True, timeout=2).stdout.strip().lower()
+        except (OSError, subprocess.SubprocessError):
+            return ""
+    try:
+        if sys.platform == "win32":
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                                r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize") as k:
+                return winreg.QueryValueEx(k, "AppsUseLightTheme")[0] == 0
+        if sys.platform == "darwin":
+            return run(["defaults", "read", "-g", "AppleInterfaceStyle"]) == "dark"
+        if ":dark" in os.environ.get("GTK_THEME", "").lower():
+            return True
+        if shutil.which("gsettings"):
+            if "dark" in run(["gsettings", "get", "org.gnome.desktop.interface", "color-scheme"]):
+                return True
+            for schema in ("org.gnome.desktop.interface", "org.cinnamon.desktop.interface",
+                           "org.mate.interface"):
+                if "dark" in run(["gsettings", "get", schema, "gtk-theme"]):
+                    return True
+        kde = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "kdeglobals"
+        if kde.is_file():
+            m = re.search(r"^ColorScheme\s*=\s*(.*)$", kde.read_text("utf-8", "ignore"), re.M)
+            return bool(m and "dark" in m.group(1).lower())
+    except Exception:
+        pass
+    return False
+
+
+def playlist_tint(i: int) -> str:
+    """Row background of the i-th playlist colour in the current theme."""
+    base, light = PLAYLIST_COLORS[i % len(PLAYLIST_COLORS)]
+    if not UI.get("tint"):
+        return light
+    mixed = _mix(_hex_rgb(UI["surface"]), _hex_rgb(base), UI["tint"])
+    return "#%02x%02x%02x" % tuple(int(round(v)) for v in mixed)
+
+
+def _hex_rgb(color: str) -> tuple[int, int, int]:
+    return int(color[1:3], 16), int(color[3:5], 16), int(color[5:7], 16)
+
+
+def _mix(a: tuple, b: tuple, t: float) -> tuple:
+    return tuple(x + (y - x) * t for x, y in zip(a, b))
+
+
+def indicator_image(master, size: int, shape: str, border: str, fill: str, mark: str | None,
+                    gap: int, back: str) -> tk.PhotoImage:
+    """Smooth (anti-aliased) check box or radio button picture, `gap` empty pixels on its right."""
+    s = float(size)
+    half, radius = s / 2, (max(2.0, s / 5) if shape == "box" else s / 2)
+
+    def shape_dist(px, py, inset):   # signed distance to the (rounded) outline, < 0 = inside
+        if shape == "box":
+            hx = half - inset - radius
+            qx, qy = abs(px - half) - hx, abs(py - half) - hx
+            out = (max(qx, 0) ** 2 + max(qy, 0) ** 2) ** 0.5
+            return out + min(max(qx, qy), 0) - radius
+        return ((px - half) ** 2 + (py - half) ** 2) ** 0.5 - (half - inset)
+
+    def seg_dist(px, py, a, b):
+        ax, ay = a
+        bx, by = b
+        dx, dy = bx - ax, by - ay
+        t = max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / (dx * dx + dy * dy)))
+        return ((px - ax - t * dx) ** 2 + (py - ay - t * dy) ** 2) ** 0.5
+
+    tick = [(s * .25, s * .52), (s * .43, s * .70), (s * .76, s * .32)]
+    width = max(1.6, s / 8)
+    bg, bc, fc = _hex_rgb(back), _hex_rgb(border), _hex_rgb(fill)
+    mc = _hex_rgb(mark) if mark else None
+    img = tk.PhotoImage(master=master, width=size + gap, height=size)
+    rows, clear = [], []
+    for y in range(size):
+        row = []
+        for x in range(size + gap):
+            px, py = x + .5, y + .5
+            outer = max(0.0, min(1.0, .5 - shape_dist(px, py, 0))) if x < size else 0.0
+            if outer <= .02:
+                clear.append((x, y))
+                row.append(back)
+                continue
+            col = _mix(bg, bc, outer)
+            col = _mix(col, fc, max(0.0, min(1.0, .5 - shape_dist(px, py, 1))))
+            if mc:
+                if shape == "box":
+                    d = min(seg_dist(px, py, tick[0], tick[1]), seg_dist(px, py, tick[1], tick[2])) - width / 2
+                else:
+                    d = ((px - half) ** 2 + (py - half) ** 2) ** 0.5 - s * .2
+                col = _mix(col, mc, max(0.0, min(1.0, .5 - d)))
+            row.append("#%02x%02x%02x" % tuple(int(round(v)) for v in col))
+        rows.append("{" + " ".join(row) + "}")
+    img.put(" ".join(rows))
+    for x, y in clear:
+        master.tk.call(img, "transparency", "set", x, y, 1)
+    return img
+
+
+def _ttk_buttonbox(self):
+    """OK / Cancel of the simple dialogs as themed buttons, right-aligned, OK highlighted."""
+    box = ttk.Frame(self, padding=(10, 4, 10, 10))
+    ttk.Button(box, text="Cancel", command=self.cancel).pack(side="right", padx=(6, 0))
+    ttk.Button(box, text=getattr(self, "ok_text", "OK"), style="Accent.TButton", command=self.ok,
+               default="active").pack(side="right")
+    self.bind("<Return>", self.ok)
+    self.bind("<Escape>", self.cancel)
+    box.pack(fill="x", side="bottom")
+
+
+simpledialog.Dialog.buttonbox = _ttk_buttonbox
+
+
+class FlowFrame(ttk.Frame):
+    """Lays its items out left to right and wraps them onto a new row when the window is too narrow
+    (small screens such as 1024 x 768). An item can have a separator line before it, which is only
+    shown when the item is not the first one of its row."""
+
+    LEAD_PAD = (4, 6)       # space left / right of a separator line
+
+    def __init__(self, master, gap: int = 0, row_gap: int = 6, **kw):
+        super().__init__(master, **kw)
+        self._items: list[tuple[tk.Widget, bool, tk.Widget | None]] = []
+        self.gap, self.row_gap, self._width = gap, row_gap, 0
+        self._pending = False
+        self.bind("<Configure>", self._on_configure)
+
+    def add(self, widget, right: bool = False, lead: bool = False):
+        """Add a child of this frame; right=True keeps it at the right edge of its row;
+        lead=True draws a separator line before it (not when it starts a row)."""
+        sep = ttk.Separator(self, orient="vertical") if lead else None
+        self._items.append((widget, right, sep))
+        # a button whose text changes ("Stop" -> "Skip pictures") makes its group wider: lay out again
+        widget.bind("<Configure>", lambda e: self._schedule(), add="+")
+        self._schedule()
+
+    def _schedule(self):
+        if not self._pending:
+            self._pending = True
+            self.after_idle(self.relayout)
+
+    def _on_configure(self, e):
+        if e.width != self._width:
+            self._width = e.width
+            self.relayout()
+
+    def relayout(self):
+        self._pending = False
+        width = self.winfo_width()
+        if width <= 1 or not self._items:
+            return
+        lead_w = sum(self.LEAD_PAD) + 1
+        rows, row, x = [], [], 0
+        for w, right, sep in self._items:
+            extra = (self.gap + (lead_w if sep is not None else 0)) if row else 0
+            if row and x + extra + w.winfo_reqwidth() > width:
+                rows.append(row)
+                row, x, extra = [], 0, 0
+            row.append((w, right, sep, extra))
+            x += extra + w.winfo_reqwidth()
+        rows.append(row)
+        y = 0
+        for row in rows:
+            x, height = 0, max(w.winfo_reqheight() for w, _, _, _ in row)
+            for i, (w, right, sep, extra) in enumerate(row):
+                if sep is not None:
+                    if i:
+                        sep.place(x=x + self.gap + self.LEAD_PAD[0], y=y + 4, width=1, height=height - 6)
+                    else:
+                        sep.place_forget()
+                wx = x + extra
+                if right:
+                    wx = max(wx, width - w.winfo_reqwidth())
+                w.place(x=wx, y=y + height - w.winfo_reqheight(), height=w.winfo_reqheight())
+                x = wx + w.winfo_reqwidth()
+            y += height + self.row_gap
+        total = y - self.row_gap
+        if int(self.cget("height") or 0) != total:
+            self.configure(height=total)
 
 
 # =============================================================================
@@ -1811,13 +2303,13 @@ class ComboDialog(simpledialog.Dialog):
         super().__init__(parent, title)
 
     def body(self, master):
-        ttk.Label(master, text=vis(self.prompt)).pack(anchor="w", padx=6, pady=(6, 2))
+        ttk.Label(master, text=vis(self.prompt)).pack(anchor="w", padx=8, pady=(10, 4))
         self.var = tk.StringVar(value=self.initial)
         self.to_logical = {vis(v): v for v in self.values}
         if vis(self.initial) != self.initial:
             self.var.set(vis(self.initial))
         cb = ttk.Combobox(master, textvariable=self.var, values=list(self.to_logical), width=45)
-        cb.pack(fill="x", padx=6, pady=(2, 6))
+        cb.pack(fill="x", padx=8, pady=(2, 8))
         return cb
 
     def apply(self):
@@ -1833,10 +2325,10 @@ class TextDialog(simpledialog.Dialog):
         super().__init__(parent, title)
 
     def body(self, master):
-        ttk.Label(master, text=vis(self.prompt)).pack(anchor="w", padx=6, pady=(6, 2))
+        ttk.Label(master, text=vis(self.prompt)).pack(anchor="w", padx=8, pady=(10, 4))
         self.var = tk.StringVar(value=vis(self.initial))
         entry = ttk.Entry(master, textvariable=self.var, width=48)
-        entry.pack(fill="x", padx=6, pady=(2, 6))
+        entry.pack(fill="x", padx=8, pady=(2, 8))
         entry.select_range(0, "end")
         return entry
 
@@ -1876,7 +2368,7 @@ class SamePictureDialog(tk.Toplevel):
         self.title("Same picture on several channels")
         self.transient(parent)
         self.resizable(False, False)
-        body = ttk.Frame(self, padding=14)
+        body = ttk.Frame(self, padding=18)
         body.pack(fill="both", expand=True)
         # the sharp preview (taken just now) when there is one, else the small thumbnail enlarged
         self._img = None
@@ -1911,9 +2403,10 @@ class SamePictureDialog(tk.Toplevel):
         sb.pack(side="right", fill="y")
         bf = ttk.Frame(body)
         bf.grid(row=3, column=0, sticky="e", pady=(14, 0))
-        ttk.Button(bf, text="⛔  Mark as geo-blocked", command=lambda: self._done("block")).pack(side="left", padx=3)
-        ttk.Button(bf, text="Not a banner", command=lambda: self._done("not")).pack(side="left", padx=3)
-        ttk.Button(bf, text="Decide later", command=lambda: self._done(None)).pack(side="left", padx=3)
+        ttk.Button(bf, text="Decide later", command=lambda: self._done(None)).pack(side="left", padx=(0, 6))
+        ttk.Button(bf, text="Not a banner", command=lambda: self._done("not")).pack(side="left", padx=(0, 6))
+        ttk.Button(bf, text="⛔  Mark as geo-blocked", style="Accent.TButton",
+                   command=lambda: self._done("block")).pack(side="left")
         self.protocol("WM_DELETE_WINDOW", lambda: self._done(None))
         self.bind("<Escape>", lambda e: self._done(None))
         self.update_idletasks()
@@ -1936,12 +2429,14 @@ class ExportDialog(simpledialog.Dialog):
         ("drop_offline", "Remove offline channels", True),
         ("drop_blocked", "Remove geo-blocked channels (“not available in your country”)", True),
         ("drop_dups", "Remove duplicates", True),
-        ("drop_unchecked", "Remove channels that were not checked", False),
+        ("drop_unchecked", "Remove channels not checked in this session", False),
         ("only_enabled_groups", "Only groups and playlists ticked ☑ on the left", True),
         ("sort_groups", "Sort groups A-Z  (otherwise: order of the group list)", False),
         ("sort_channels", "Sort channels A-Z inside each group  (otherwise: original order)", False),
         ("split", "Save one playlist file per group (into a folder)", False),
     ]
+
+    ok_text = "Save…"
 
     def __init__(self, parent, summary, saved):
         self.summary, self.saved, self.result = summary, saved or {}, None
@@ -1952,13 +2447,13 @@ class ExportDialog(simpledialog.Dialog):
         bold.configure(weight="bold")
         self._bold = bold
         ttk.Label(master, text=self.summary, font=bold).grid(
-            row=0, column=0, sticky="w", padx=8, pady=(8, 6))
+            row=0, column=0, sticky="w", padx=8, pady=(10, 8))
         self.vars = {}
         for r, (key, text, default) in enumerate(self.OPTIONS, 1):
             self.vars[key] = tk.BooleanVar(value=self.saved.get(key, default))
-            ttk.Checkbutton(master, text=text, variable=self.vars[key]).grid(row=r, column=0, sticky="w", padx=8, pady=2)
-        fmt = ttk.LabelFrame(master, text="Format", padding=6)
-        fmt.grid(row=len(self.OPTIONS) + 1, column=0, sticky="we", padx=8, pady=8)
+            ttk.Checkbutton(master, text=text, variable=self.vars[key]).grid(row=r, column=0, sticky="w", padx=8, pady=1)
+        fmt = ttk.LabelFrame(master, text="Format", padding=(10, 6))
+        fmt.grid(row=len(self.OPTIONS) + 1, column=0, sticky="we", padx=8, pady=(12, 6))
         self.fmt = tk.StringVar(value=self.saved.get("format", "m3u8"))
         ttk.Radiobutton(fmt, text="M3U8 – TV & radio, keeps logos, EPG, groups", value="m3u8",
                         variable=self.fmt).pack(anchor="w")
@@ -1981,8 +2476,7 @@ class App(tk.Tk):
         super().__init__(className="PlaylistChecker")
         self.title(APP_TITLE)
         self._set_app_icon()
-        self.geometry("1320x800")
-        self.minsize(980, 560)
+        self._fit_to_screen()
         self.settings = load_settings()
 
         self.channels: list[Channel] = []
@@ -2013,6 +2507,12 @@ class App(tk.Tk):
         self._previous: dict[int, tuple] = {}
         self._manual_locked: set[int] = set()   # manually marked while a check was running
         self._aux_checkers: set = set()         # picture checkers of Mark / same-picture dialogs
+        self._undo: list[dict] = []             # Edit -> Undo / Redo: list states before / after changes
+        self.v_remember_results = tk.BooleanVar(value=self.settings.get("remember_results", True))
+        self._results: dict = load_results() if self.v_remember_results.get() else {}
+        self._restored_results: list[float] = []   # times of the results restored during the last load
+        self._results_forgotten_at = 0.0   # Forget remembered check results: older results are not saved again
+        self._redo: list[dict] = []
 
         self.v_hide_hidden = tk.BooleanVar(value=self.settings.get("hide_hidden", True))
         self.v_date_names = tk.BooleanVar(value=self.settings.get("date_names", True))
@@ -2058,6 +2558,7 @@ class App(tk.Tk):
         is_x11 = self.tk.call("tk", "windowingsystem") == "x11"  # Windows / macOS draw RTL text themselves
         self.v_bidi = tk.BooleanVar(value=self.settings.get("bidi_fix", is_x11))
         BIDI["enabled"] = self.v_bidi.get()
+        self.v_theme = tk.StringVar(value=self.settings.get("theme", "auto"))
         self._setup_style()
         self._build_menu()
         self._build_toolbar()
@@ -2085,16 +2586,287 @@ class App(tk.Tk):
             self.refresh_all()
 
     # ------------------------------------------------------------------ UI build
+    def _fit_to_screen(self, width: int = 1320, height: int = 800):
+        """Open at 1320 x 800, or smaller on a small screen (1024 x 768, 1280 x 720 ...)."""
+        sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+        # leave room for the window frame and the desktop's panels / taskbar
+        w, h = min(width, sw - 20), min(height, sh - 90)
+        self.minsize(min(800, w), min(520, h))
+        if w == width and h == height:
+            self.geometry(f"{w}x{h}")
+            return
+        self.geometry(f"{w}x{h}+{max((sw - w) // 2, 0)}+{max((sh - h) // 3, 0)}")
+        # a small screen: use all of it (the window manager keeps the panels free)
+        try:
+            if self.tk.call("tk", "windowingsystem") == "x11":
+                self.attributes("-zoomed", True)
+            else:
+                self.state("zoomed")
+        except tk.TclError:
+            pass
+
     def _setup_style(self):
         st = ttk.Style(self)
-        if sys.platform.startswith("linux") and "clam" in st.theme_names():
-            st.theme_use("clam")
-        line = tkfont.nametofont("TkDefaultFont").metrics("linespace")
-        st.configure("Treeview", rowheight=line + 6)
-        st.configure("Big.TButton", padding=(10, 4))
+        self._native_theme = st.theme_use()
+        base = tkfont.nametofont("TkDefaultFont")
+        self._line = base.metrics("linespace")
+        self._bold_font = base.copy()
+        self._bold_font.configure(weight="bold")
+        self._italic_font = base.copy()
+        self._italic_font.configure(slant="italic")
+        self._caption_font = base.copy()
+        size = int(base.cget("size"))
+        self._caption_font.configure(size=size - 1 if size > 0 else size + 1)
+        self._theme_gen = 0
+        self._apply_theme()
+
+    def _theme_name(self) -> str:
+        choice = self.v_theme.get()
+        if choice in THEMES:
+            return choice
+        return "dark" if system_prefers_dark() else "light"
+
+    def on_theme(self):
+        self._apply_theme()
+        self.save_settings()
+
+    def _apply_theme(self):
+        """Draw the window in the chosen colours; can be called again to switch theme at once."""
+        name = self._theme_name()
+        UI.clear()
+        UI.update(THEMES[name])
+        st = ttk.Style(self)
+        # Linux: always the drawn theme; Windows / macOS: their native look, the drawn one only for dark
+        use_clam = "clam" in st.theme_names() and (sys.platform.startswith("linux") or name == "dark")
+        st.theme_use("clam" if use_clam else self._native_theme)
+        line = self._line
+        st.configure("Treeview", rowheight=line + 8)
+        st.configure("Accent.TButton", padding=(12, 4))
+        st.configure("Small.TButton", padding=(6, 1))
+        st.configure("Section.TLabel", font=self._bold_font)
+        st.configure("Muted.TLabel", foreground="#666666")
+        st.configure("Caption.TLabel", foreground="#666666", font=self._caption_font)
+        was_themed = THEMED["on"]
+        THEMED["on"] = use_clam
+        if not use_clam:   # Windows / macOS: keep the native look
+            self._tool_styles(st)
+            if was_themed:            # back from dark: undo the dark colours of the classic widgets
+                self.configure(background=UI["bg"])
+                self._classic_colors()
+                self._recolor_widgets()
+            self._retint_tree()
+            return
+        c = UI
+        self.configure(background=c["bg"])
+        self._classic_colors()
+        self._style_ttk(st, c, line)
+        self._recolor_widgets()
+        self._retint_tree()
+
+    def _classic_colors(self):
+        """Colours of classic Tk widgets created from now on (menus, simple dialogs, file dialog...)."""
+        c = UI
+        # classic Tk widgets: menus, simple dialogs, drop-down lists, file dialog
+        for pattern, value in (
+                ("*Toplevel.background", c["bg"]), ("*Frame.background", c["bg"]),
+                ("*Label.background", c["bg"]), ("*Label.foreground", c["text"]),
+                ("*Menu.background", c["surface"]), ("*Menu.foreground", c["text"]),
+                ("*Menu.activeBackground", c["accent"]), ("*Menu.activeForeground", c["on_accent"]),
+                ("*Menu.disabledForeground", c["disabled"]), ("*Menu.selectColor", c["accent"]),
+                ("*Menu.relief", "flat"), ("*Menu.borderWidth", 1), ("*Menu.activeBorderWidth", 0),
+                ("*Entry.background", c["surface"]), ("*Entry.foreground", c["text"]),
+                ("*Entry.relief", "flat"), ("*Entry.highlightThickness", 1),
+                ("*Entry.highlightBackground", c["border_strong"]), ("*Entry.highlightColor", c["accent"]),
+                ("*Entry.selectBackground", c["accent"]), ("*Entry.selectForeground", c["on_accent"]),
+                ("*Entry.insertBackground", c["text"]),
+                ("*Listbox.background", c["surface"]), ("*Listbox.foreground", c["text"]),
+                ("*Listbox.relief", "flat"), ("*Listbox.highlightThickness", 1),
+                ("*Listbox.highlightBackground", c["border"]), ("*Listbox.highlightColor", c["border"]),
+                ("*Listbox.selectBackground", c["accent"]), ("*Listbox.selectForeground", c["on_accent"]),
+                ("*TCombobox*Listbox.highlightThickness", 0), ("*Button.background", c["surface"]),
+                ("*Button.activeBackground", c["hover"]), ("*Button.relief", "flat"),
+                ("*Button.highlightThickness", 1), ("*Button.highlightBackground", c["border_strong"]),
+                ("*Checkbutton.background", c["bg"]), ("*Radiobutton.background", c["bg"]),
+                ("*Scrollbar.background", c["thumb"]), ("*Scrollbar.troughColor", c["bg"]),
+                ("*Text.background", c["surface"]), ("*Text.foreground", c["text"])):
+            self.option_add(pattern, value)
+
+    def _style_ttk(self, st: ttk.Style, c: dict, line: int):
+        flat = {"lightcolor": c["surface"], "darkcolor": c["surface"]}
+        st.configure(".", background=c["bg"], foreground=c["text"], bordercolor=c["border_strong"],
+                     troughcolor=c["header"], focuscolor=c["accent"], selectbackground=c["accent"],
+                     selectforeground=c["on_accent"], insertcolor=c["text"], lightcolor=c["bg"], darkcolor=c["bg"])
+        st.map(".", foreground=[("disabled", c["disabled"])],
+               background=[("disabled", c["bg"]), ("active", c["hover"])])
+        st.configure("Muted.TLabel", foreground=c["muted"])
+        st.configure("Caption.TLabel", foreground=c["muted"])
+        st.configure("TSeparator", background=c["border"])
+
+        # buttons: flat, thin border; the main actions in the accent colour
+        st.configure("TButton", background=c["surface"], bordercolor=c["border_strong"], padding=(10, 4),
+                     anchor="center", **flat)
+        st.map("TButton",
+               background=[("disabled", c["bg"]), ("pressed", c["pressed"]), ("active", c["hover"])],
+               lightcolor=[("disabled", c["bg"]), ("pressed", c["pressed"]), ("active", c["hover"])],
+               darkcolor=[("disabled", c["bg"]), ("pressed", c["pressed"]), ("active", c["hover"])],
+               bordercolor=[("disabled", c["border"]), ("focus", c["accent"])])
+        st.configure("Accent.TButton", background=c["accent"], foreground=c["on_accent"],
+                     bordercolor=c["accent_pressed"], lightcolor=c["accent"], darkcolor=c["accent"])
+        off = c["accent_disabled"]
+        st.map("Accent.TButton",
+               foreground=[("disabled", c["accent_disabled_text"])],
+               background=[("disabled", off), ("pressed", c["accent_pressed"]), ("active", c["accent_hover"])],
+               lightcolor=[("disabled", off), ("pressed", c["accent_pressed"]), ("active", c["accent_hover"])],
+               darkcolor=[("disabled", off), ("pressed", c["accent_pressed"]), ("active", c["accent_hover"])],
+               bordercolor=[("disabled", off), ("focus", c["accent_pressed"])])
+        st.configure("Small.TButton", padding=(7, 1))
+        self._tool_styles(st)
+
+        # check / radio buttons: smooth accent-filled box / circle with a white tick / dot
+        for cls in ("TCheckbutton", "TRadiobutton"):
+            st.configure(cls, background=c["bg"], padding=(2, 2))
+            st.map(cls, background=[("active", c["bg"])])
+        try:
+            self._make_indicators(st, max(13, round(line * .78)))
+        except tk.TclError:
+            pass   # keep the theme's own indicators
+
+        # text fields
+        for cls in ("TEntry", "TCombobox", "TSpinbox"):
+            st.configure(cls, fieldbackground=c["surface"], background=c["surface"], bordercolor=c["border_strong"],
+                         arrowcolor=c["muted"], padding=(6, 3), **flat)
+            st.map(cls, bordercolor=[("focus", c["accent"])], lightcolor=[("focus", c["accent_soft"])],
+                   fieldbackground=[("disabled", c["bg"]), ("readonly", c["surface"])],
+                   background=[("active", c["hover"]), ("pressed", c["pressed"])],
+                   arrowcolor=[("disabled", c["disabled"]), ("active", c["text"])])
+        st.map("TCombobox", selectbackground=[("readonly", "!focus", c["surface"]), ("readonly", c["accent_soft"])],
+               selectforeground=[("readonly", c["text"])])
+        st.configure("TSpinbox", arrowsize=12)
+        st.configure("TMenubutton", background=c["surface"], bordercolor=c["border_strong"], arrowcolor=c["muted"],
+                     padding=(8, 3), **flat)
+        st.map("TMenubutton", background=[("disabled", c["bg"]), ("active", c["hover"])],
+               lightcolor=[("disabled", c["bg"]), ("active", c["hover"])],
+               darkcolor=[("disabled", c["bg"]), ("active", c["hover"])],
+               bordercolor=[("disabled", c["border"])])
+
+        # tables
+        st.configure("Treeview", background=c["surface"], fieldbackground=c["surface"], foreground=c["text"],
+                     bordercolor=c["border"], **flat)
+        st.map("Treeview", background=[("selected", "focus", c["accent"]), ("selected", c["accent_soft"])],
+               foreground=[("selected", "focus", c["on_accent"]), ("selected", c["text"])])
+        st.configure("Treeview.Heading", background=c["header"], foreground=c["muted"], bordercolor=c["border"],
+                     lightcolor=c["header"], darkcolor=c["border"], relief="flat", padding=(6, 4), font=self._bold_font)
+        st.map("Treeview.Heading", background=[("pressed", c["pressed"]), ("active", c["hover"])],
+               lightcolor=[("pressed", c["pressed"]), ("active", c["hover"])],
+               foreground=[("active", c["text"])])
+
+        # slim scroll bars without arrow buttons
+        for orient, sticky in (("Vertical", "ns"), ("Horizontal", "we")):
+            st.layout(f"{orient}.TScrollbar",
+                      [(f"{orient}.Scrollbar.trough",
+                        {"sticky": sticky,
+                         "children": [(f"{orient}.Scrollbar.thumb", {"expand": "1", "sticky": "nswe"})]})])
+            st.configure(f"{orient}.TScrollbar", troughcolor=c["bg"], background=c["thumb"], bordercolor=c["bg"],
+                         lightcolor=c["thumb"], darkcolor=c["thumb"], arrowsize=11, gripcount=0, relief="flat")
+            st.map(f"{orient}.TScrollbar",
+                   background=[("pressed", c["thumb_hover"]), ("active", c["thumb_hover"])],
+                   lightcolor=[("pressed", c["thumb_hover"]), ("active", c["thumb_hover"])],
+                   darkcolor=[("pressed", c["thumb_hover"]), ("active", c["thumb_hover"])])
+
+        st.configure("Horizontal.TProgressbar", background=c["accent"], troughcolor=c["header"],
+                     bordercolor=c["border"], lightcolor=c["accent"], darkcolor=c["accent"], thickness=10)
+        st.configure("TLabelframe", background=c["bg"], bordercolor=c["border"], lightcolor=c["bg"], darkcolor=c["bg"])
+        st.configure("TLabelframe.Label", background=c["bg"], foreground=c["text"], font=self._bold_font)
+        st.configure("Sash", sashthickness=8, gripcount=0, background=c["bg"], lightcolor=c["bg"],
+                     darkcolor=c["bg"], bordercolor=c["bg"])
+        st.configure("TPanedwindow", background=c["bg"])
+
+    @staticmethod
+    def _tool_styles(st: ttk.Style):
+        """Slimmer toolbar buttons (the toolbar has to fit a 1024-pixel screen)."""
+        st.configure("Tool.TButton", padding=(7, 4))
+        st.configure("Tool.Accent.TButton", padding=(8, 4))
+
+    def _make_indicators(self, st: ttk.Style, size: int):
+        c, gap = UI, max(5, size // 3)
+        disabled_on, mark = c["accent_disabled"], c["on_accent"]
+        looks = {  # state -> (border, fill, mark)
+            "off": (c["border_strong"], c["surface"], None),
+            "off_hover": (c["accent"], c["surface"], None),
+            "off_disabled": (c["border"], c["bg"], None),
+            "on": (c["accent_pressed"], c["accent"], mark),
+            "on_hover": (c["accent_pressed"], c["accent_hover"], mark),
+            "on_disabled": (disabled_on, disabled_on, c["accent_disabled_text"]),
+        }
+        self._indicator_images = {}
+        self._theme_gen += 1          # an element name can be created only once
+        for cls, shape, name in (("TCheckbutton", "box", "Checkbutton"), ("TRadiobutton", "circle", "Radiobutton")):
+            im = {k: indicator_image(self, size, shape, *v, gap=gap, back=c["bg"]) for k, v in looks.items()}
+            self._indicator_images[cls] = im
+            element = f"pc{self._theme_gen}.{name}.indicator"
+            st.element_create(element, "image", im["off"],
+                              ("disabled", "selected", im["on_disabled"]), ("disabled", im["off_disabled"]),
+                              ("selected", "active", im["on_hover"]), ("selected", im["on"]),
+                              ("active", im["off_hover"]), sticky="")
+            st.layout(cls, [(f"{name}.padding", {"sticky": "nswe", "children": [
+                (element, {"side": "left", "sticky": ""}),
+                (f"{name}.focus", {"side": "left", "sticky": "w", "children": [
+                    (f"{name}.label", {"sticky": "nswe"})]})]})])
+
+    def _color_menubar(self):
+        mb = getattr(self, "_menubar", None)
+        if mb is not None and THEMED["on"]:   # the menu bar blends with the window, the menus are lighter
+            mb.configure(background=UI["bg"], foreground=UI["text"], activebackground=UI["hover"],
+                         activeforeground=UI["text"], borderwidth=0)
+
+    def _recolor_widgets(self):
+        """Give the classic Tk widgets that already exist the colours of the theme (ttk ones follow the style)."""
+        c = UI
+        looks = {
+            "Menu": {"-background": c["surface"], "-foreground": c["text"], "-activebackground": c["accent"],
+                     "-activeforeground": c["on_accent"], "-disabledforeground": c["disabled"],
+                     "-selectcolor": c["accent"]},
+            "Toplevel": {"-background": c["bg"]},
+            "Frame": {"-background": c["bg"]},
+            "Label": {"-background": c["bg"], "-foreground": c["text"]},
+            "Listbox": {"-background": c["surface"], "-foreground": c["text"], "-selectbackground": c["accent"],
+                        "-selectforeground": c["on_accent"], "-highlightbackground": c["border"],
+                        "-highlightcolor": c["border"]},
+            "Entry": {"-background": c["surface"], "-foreground": c["text"], "-insertbackground": c["text"],
+                      "-highlightbackground": c["border_strong"], "-highlightcolor": c["accent"],
+                      "-selectbackground": c["accent"], "-selectforeground": c["on_accent"]},
+        }
+        root_class = self.winfo_class()
+        todo = ["."]
+        while todo:      # walk the Tcl widget tree: it also has widgets Tk made itself (menu bar copies, drop-downs)
+            path = todo.pop()
+            try:
+                cls = self.tk.call("winfo", "class", path)
+                look = looks.get("Toplevel" if cls == root_class else cls)
+                if look:
+                    for opt, value in look.items():
+                        self.tk.call(path, "configure", opt, value)
+                todo.extend(self.tk.splitlist(self.tk.call("winfo", "children", path)))
+            except tk.TclError:
+                continue
+        self._color_menubar()
+
+    def _retint_tree(self):
+        """Status colours and row tints of the channel table in the current theme."""
+        tree = getattr(self, "tree", None)
+        if tree is None:
+            return
+        tree.tag_configure("excluded", foreground=UI["excluded"])
+        for status, color in UI["status"].items():
+            tree.tag_configure(status, foreground=color)
+        tree.tag_configure("dup", background=UI["dup_bg"])
+        for tag in self._swatch_images.get("_tags", ()):
+            tree.tag_configure(tag, background=playlist_tint(int(tag[3:])))
 
     def _build_menu(self):
         mb = tk.Menu(self)
+        self._menubar = mb
+        self._color_menubar()
         m = tk.Menu(mb, tearoff=0)
         m.add_command(label="Open playlist files…", accelerator="Ctrl+O", command=self.open_files)
         m.add_command(label="Open folder with playlists…", command=self.open_folder)
@@ -2109,6 +2881,10 @@ class App(tk.Tk):
         mb.add_cascade(label="File", menu=m)
 
         m = tk.Menu(mb, tearoff=0)
+        m.configure(postcommand=lambda mm=m: self._edit_menu_post(mm))
+        m.add_command(label="Undo", accelerator="Ctrl+Z", command=self.undo, state="disabled")
+        m.add_command(label="Redo", accelerator="Ctrl+Y", command=self.redo, state="disabled")
+        m.add_separator()
         m.add_command(label="Copy stream URLs", accelerator="Ctrl+C", command=self.copy_url)
         m.add_command(label="Paste stream links / playlist", accelerator="Ctrl+V", command=self.paste_channels)
         m.add_separator()
@@ -2150,11 +2926,18 @@ class App(tk.Tk):
         m.add_checkbutton(label="Remember ticked / unticked groups and playlists", variable=self.v_remember_ticks,
                           command=self.on_remember_option)
         m.add_command(label="Forget remembered groups and playlists…", command=self.forget_ticks)
+        m.add_checkbutton(label="Remember check results between sessions", variable=self.v_remember_results,
+                          command=self.on_remember_results)
+        m.add_command(label="Forget remembered check results…", command=self.forget_results)
         m.add_checkbutton(label="Hide unticked groups and playlists in the channel list",
                           variable=self.v_hide_excluded,
                           command=lambda: (self.save_settings(), self.refresh_channels()))
         m.add_checkbutton(label="Tint rows with the playlist color", variable=self.v_tint,
                           command=lambda: (self.save_settings(), self.refresh_channels()))
+        thm = tk.Menu(m, tearoff=0)
+        for value, label in THEME_CHOICES:
+            thm.add_radiobutton(label=label, value=value, variable=self.v_theme, command=self.on_theme)
+        m.add_cascade(label="Theme (light / dark)", menu=thm)
         m.add_separator()
         geo = tk.Menu(m, tearoff=0)
         geo.add_checkbutton(label="By the server's answer (451, 403 “your country”, redirects)",
@@ -2213,35 +2996,43 @@ class App(tk.Tk):
         self.config(menu=mb)
 
     def _build_toolbar(self):
-        tb = ttk.Frame(self, padding=(8, 8, 8, 4))
+        outer = ttk.Frame(self, padding=(8, 8, 8, 8))
+        outer.pack(fill="x")
+        tb = FlowFrame(outer, row_gap=8)     # wraps onto two rows on small screens
         tb.pack(fill="x")
 
-        def btn(text, cmd, style="TButton"):
-            b = ttk.Button(tb, text=text, command=cmd, style=style)
+        def group(title, right=False, lead=True):
+            """A captioned cluster of buttons (with a separator before it when it follows another)."""
+            f = ttk.Frame(tb)
+            ttk.Label(f, text=title, style="Caption.TLabel").grid(row=0, column=0, sticky="w", padx=2, pady=(0, 3))
+            row = ttk.Frame(f)
+            row.grid(row=1, column=0, sticky="w")
+            tb.add(f, right, lead)
+            return row
+
+        def btn(parent, text, cmd, style="Tool.TButton"):
+            # width 0 = as wide as the text: the whole toolbar fits on one row at 1024 pixels
+            b = ttk.Button(parent, text=text, command=cmd, style=style, width=0)
             b.pack(side="left", padx=2)
             return b
 
-        def sep():
-            ttk.Separator(tb, orient="vertical").pack(side="left", fill="y", padx=8)
-
-        btn("Open files…", self.open_files)
-        btn("Open folder…", self.open_folder)
-        btn("Add from URL…", self.open_url)
-        sep()
-        self.btn_check = btn("▶  Check streams", self.check_all, "Big.TButton")
-        self.btn_recheck = btn("↻  Recheck offline", self.recheck_offline)
-        self.btn_stop = btn("■  Stop", self.stop_check)
+        g = group("Playlists", lead=False)    # the caption says what the short labels open
+        btn(g, "Files…", self.open_files)
+        btn(g, "Folder…", self.open_folder)
+        btn(g, "URL…", self.open_url)
+        ttk.Separator(g, orient="vertical").pack(side="left", fill="y", padx=4, pady=5)
+        btn(g, "Clear list", self.clear_all)     # set apart by a line: it empties the list
+        g = group("Check")
+        self.btn_check = btn(g, "▶  Check streams", self.check_all, "Tool.Accent.TButton")
+        self.btn_recheck = btn(g, "↻  Recheck offline", self.recheck_offline)
+        self.btn_stop = btn(g, "■  Stop", self.stop_check)
         self.btn_stop.state(["disabled"])
-        sep()
-        btn("💾  Save new playlist…", self.export_dialog, "Big.TButton")
-        btn("Export report…", self.export_report)
-        sep()
-        btn("Clear", self.clear_all)
+        g = group("Save")
+        btn(g, "💾  Save playlist…", self.export_dialog, "Tool.Accent.TButton")
+        btn(g, "Export report…", self.export_report)
 
     def _build_settings(self):
         s = self.settings
-        row1 = ttk.Frame(self, padding=(10, 0, 10, 2))
-        row1.pack(fill="x")
         self.v_timeout = tk.StringVar(value=str(s.get("timeout", 8)))
         self.v_threads = tk.StringVar(value=str(s.get("threads", 20)))
         self.v_deep = tk.BooleanVar(value=s.get("deep_hls", True))
@@ -2250,45 +3041,67 @@ class App(tk.Tk):
         self.v_dup_name = tk.BooleanVar(value=s.get("dup_name", False))
         self.v_dup_quality = tk.BooleanVar(value=s.get("dup_quality", True))
 
-        ttk.Label(row1, text="Check:  timeout (s)").pack(side="left")
-        ttk.Spinbox(row1, from_=2, to=60, width=4, textvariable=self.v_timeout).pack(side="left", padx=(4, 12))
-        ttk.Label(row1, text="parallel checks").pack(side="left")
-        ttk.Spinbox(row1, from_=1, to=100, width=4, textvariable=self.v_threads).pack(side="left", padx=(4, 12))
-        ttk.Label(row1, text="User-Agent").pack(side="left")
-        ttk.Entry(row1, textvariable=self.v_ua, width=26).pack(side="left", padx=(4, 12))
-        ttk.Checkbutton(row1, text="Deep HLS check (test the video itself)", variable=self.v_deep).pack(side="left", padx=4)
-        ttk.Checkbutton(row1, text="Ignore SSL certificate errors", variable=self.v_ssl).pack(side="left", padx=4)
+        ttk.Separator(self, orient="horizontal").pack(fill="x")
+        outer = ttk.Frame(self, padding=(12, 6, 12, 10))
+        outer.pack(fill="x")
+        box = FlowFrame(outer, gap=10, row_gap=8)    # wraps onto two rows on small screens
+        box.pack(fill="x")
 
-        row2 = ttk.Frame(self, padding=(10, 0, 10, 4))
-        row2.pack(fill="x")
-        ttk.Label(row2, text="Duplicates:").pack(side="left")
-        for text, var in (("same stream URL", self.v_dup_url), ("same channel name", self.v_dup_name),
-                          ("ignore HD / FHD / 4K / 1080p in names", self.v_dup_quality)):
-            ttk.Checkbutton(row2, text=text, variable=var, command=self.on_dup_options).pack(side="left", padx=6)
+        def card(title):
+            """One category of options: a titled box, its options in two rows."""
+            lf = ttk.LabelFrame(box, text=title, padding=(8, 2, 8, 6))
+            box.add(lf)
+            rows = []
+            for r in range(2):
+                f = ttk.Frame(lf)
+                f.pack(anchor="w", pady=(4 if r else 0, 0))
+                rows.append(f)
+            return rows
+
+        # connection: how the program talks to the servers (the User-Agent is in Settings -> User-Agent)
+        r1, r2 = card("Connection")
+        ttk.Label(r1, text="Timeout (s)").pack(side="left")
+        ttk.Spinbox(r1, from_=2, to=60, width=3, textvariable=self.v_timeout).pack(side="left", padx=(6, 12))
+        ttk.Label(r1, text="Parallel checks").pack(side="left")
+        ttk.Spinbox(r1, from_=1, to=100, width=3, textvariable=self.v_threads).pack(side="left", padx=(6, 0))
+        ttk.Checkbutton(r2, text="Ignore SSL certificate errors", variable=self.v_ssl).pack(side="left")
+
+        # stream test: how deep a channel is tested
+        r1, r2 = card("Stream test")
+        ttk.Checkbutton(r1, text="Deep HLS check (test the video)", variable=self.v_deep).pack(side="left")
+        # same variable as Settings -> "Black screen ... = offline", so both stay in step
+        ttk.Checkbutton(r2, text="Black screen = offline" + ("" if self.ffmpeg else "  (needs ffmpeg)"),
+                        variable=self.v_black, command=self.on_black_option).pack(side="left")
+
+        r1, r2 = card("Duplicates")
+        for row, text, var in ((r1, "Same stream URL", self.v_dup_url), (r1, "Same channel name", self.v_dup_name),
+                               (r2, "Ignore HD / FHD / 4K / 1080p in names", self.v_dup_quality)):
+            ttk.Checkbutton(row, text=text, variable=var, command=self.on_dup_options).pack(side="left", padx=(0, 12))
+        ttk.Separator(self, orient="horizontal").pack(fill="x")
 
     def _build_statusbar(self):
-        sb = ttk.Frame(self, padding=(10, 3, 10, 6))
+        sb = ttk.Frame(self, padding=(12, 6, 12, 7))
         sb.pack(fill="x", side="bottom")
-        self.progress = ttk.Progressbar(sb, length=240, mode="determinate")
-        self.progress.pack(side="left")
+        ttk.Separator(self, orient="horizontal").pack(fill="x", side="bottom")
+        self.progress = ttk.Progressbar(sb, length=220, mode="determinate")
+        self.progress.pack(side="left", pady=1)
         self.lbl_status = ttk.Label(sb, text="")
-        self.lbl_status.pack(side="left", padx=10)
+        self.lbl_status.pack(side="left", padx=12)
 
     def _build_main(self):
         pw = ttk.Panedwindow(self, orient="horizontal")
-        pw.pack(fill="both", expand=True, padx=10, pady=4)
+        pw.pack(fill="both", expand=True, padx=12, pady=(10, 8))
         left, right = ttk.Frame(pw), ttk.Frame(pw)
         pw.add(left, weight=0)
         pw.add(right, weight=1)
 
         # ---- groups
-        ttk.Label(left, text="Groups   (click ☑ to include / exclude)").pack(anchor="w", pady=(0, 3))
-        gf = ttk.Frame(left)
-        gf.pack(fill="both", expand=True)
+        self._section_title(left, "Groups", "click ☑ to include / exclude").pack(fill="x", pady=(0, 5))
+        gf = ttk.Frame(left)       # packed last (below): on a small screen it shrinks, not the playlists
         self.gtree = ttk.Treeview(gf, columns=("inc", "name", "total", "online"), show="headings", selectmode="browse")
         for col, text, w, anchor, stretch in (("inc", "✓", 30, "center", False), ("name", "Group", 200, "w", True),
                                               ("total", "Ch.", 48, "e", False), ("online", "Online", 60, "e", False)):
-            self.gtree.heading(col, text=text)
+            self.gtree.heading(col, text=text, anchor=anchor)
             self.gtree.column(col, width=w, anchor=anchor, stretch=stretch)
         gsb = ttk.Scrollbar(gf, orient="vertical", command=self.gtree.yview)
         self.gtree.configure(yscrollcommand=gsb.set)
@@ -2300,22 +3113,20 @@ class App(tk.Tk):
         self.gtree.bind("<F2>", lambda e: self.rename_group())
 
         gb = ttk.Frame(left)
-        gb.pack(fill="x", pady=(4, 0))
         for text, cmd, w in (("All ☑", lambda: self.set_all_groups(True), 6), ("None ☐", lambda: self.set_all_groups(False), 7),
                              ("▲", lambda: self.move_group(-1), 2), ("▼", lambda: self.move_group(1), 2),
                              ("Rename…", self.rename_group, 8)):
-            ttk.Button(gb, text=text, width=w, command=cmd).pack(side="left", padx=1)
+            ttk.Button(gb, text=text, width=w, command=cmd, style="Small.TButton").pack(side="left", padx=(0, 4))
 
         # ---- playlists (color legend, filter, include / exclude)
-        ttk.Label(left, text="Playlists   (click a name to show only it)").pack(anchor="w", pady=(10, 3))
+        ptitle = self._section_title(left, "Playlists", "click a name to show only it")
         pf = ttk.Frame(left)
-        pf.pack(fill="x")
         self.ptree = ttk.Treeview(pf, columns=("inc", "name", "total", "online"), show="tree headings",
                                   selectmode="browse", height=5)
         self.ptree.column("#0", width=30, minwidth=30, stretch=False, anchor="center")
         for col, text, w, anchor, stretch in (("inc", "✓", 30, "center", False), ("name", "Playlist", 170, "w", True),
                                               ("total", "Ch.", 48, "e", False), ("online", "Online", 60, "e", False)):
-            self.ptree.heading(col, text=text)
+            self.ptree.heading(col, text=text, anchor=anchor)
             self.ptree.column(col, width=w, anchor=anchor, stretch=stretch)
         psb = ttk.Scrollbar(pf, orient="vertical", command=self.ptree.yview)
         self.ptree.configure(yscrollcommand=psb.set)
@@ -2324,33 +3135,40 @@ class App(tk.Tk):
         self.ptree.bind("<<TreeviewSelect>>", self.on_source_select)
         self.ptree.bind("<Button-1>", self.on_source_click)
         self._suppress_source_select = False
+        # bottom-up, so the playlists and the group buttons always keep their room
+        pf.pack(side="bottom", fill="x")
+        ptitle.pack(side="bottom", fill="x", pady=(14, 5))
+        gb.pack(side="bottom", fill="x", pady=(6, 0))
+        gf.pack(fill="both", expand=True)
 
         # ---- filter bar
-        fb = ttk.Frame(right)
+        fb = ttk.Frame(right, padding=(8, 0, 0, 0))
         fb.pack(fill="x")
-        ttk.Label(fb, text="Search:").pack(side="left")
+        ttk.Label(fb, text="Search").pack(side="left")
         self.v_search = tk.StringVar()
-        ttk.Entry(fb, textvariable=self.v_search, width=32).pack(side="left", padx=(4, 14))
+        ttk.Entry(fb, textvariable=self.v_search, width=32).pack(side="left", padx=(6, 18))
         self.v_search.trace_add("write", lambda *a: self._debounced_refresh())
-        ttk.Label(fb, text="Show:").pack(side="left")
+        ttk.Label(fb, text="Show").pack(side="left")
         self.v_show = tk.StringVar(value="All")
         cb = ttk.Combobox(fb, textvariable=self.v_show, values=SHOW_OPTIONS, state="readonly", width=28)
-        cb.pack(side="left", padx=4)
+        cb.pack(side="left", padx=6)
         cb.bind("<<ComboboxSelected>>", lambda e: self.refresh_channels())
-        self.lbl_shown = ttk.Label(fb, text="")
+        self.lbl_shown = ttk.Label(fb, text="", style="Muted.TLabel")
         self.lbl_shown.pack(side="right")
 
         # ---- channel table
-        tf = ttk.Frame(right)
-        tf.pack(fill="both", expand=True, pady=(4, 0))
-        self.cols = ("num", "status", "name", "group", "info", "dup", "url", "source")
-        self.col_titles = {"num": "#", "status": "Status", "name": "Channel", "group": "Group",
+        tf = ttk.Frame(right, padding=(8, 0, 0, 0))
+        tf.pack(fill="both", expand=True, pady=(7, 0))
+        self.cols = ("num", "status", "name", "group", "quality", "info", "dup", "url", "source")
+        self.col_titles = {"num": "#", "status": "Status", "name": "Channel", "group": "Group", "quality": "Quality",
                            "info": "Check result", "dup": "Duplicate", "url": self._url_title(), "source": "Playlist"}
-        widths = {"num": 50, "status": 125, "name": 210, "group": 130, "info": 230, "dup": 120, "url": 330, "source": 110}
+        widths = {"num": 50, "status": 125, "name": 210, "group": 130, "quality": 235, "info": 230, "dup": 120,
+                  "url": 330, "source": 110}
         self.tree = ttk.Treeview(tf, columns=self.cols, show="tree headings", selectmode="extended")
         self.tree.column("#0", width=30, minwidth=30, stretch=False, anchor="center")  # playlist color
         for c in self.cols:
-            self.tree.heading(c, text=self.col_titles[c], command=lambda c=c: self.sort_by(c))
+            self.tree.heading(c, text=self.col_titles[c], command=lambda c=c: self.sort_by(c),
+                              anchor="e" if c == "num" else "w")
             self.tree.column(c, width=widths[c], anchor="e" if c == "num" else "w",
                              stretch=c in ("name", "url", "info"))
         vsb = ttk.Scrollbar(tf, orient="vertical", command=self.tree.yview)
@@ -2361,13 +3179,9 @@ class App(tk.Tk):
         hsb.grid(row=1, column=0, sticky="ew")
         tf.rowconfigure(0, weight=1)
         tf.columnconfigure(0, weight=1)
-        self.tree.tag_configure("excluded", foreground="#a0a0a0")
-        self.tree.tag_configure(ONLINE, foreground="#1b7a34")
-        self.tree.tag_configure(OFFLINE, foreground="#c62828")
-        self.tree.tag_configure(BLOCKED, foreground="#8e24aa")
-        self.tree.tag_configure(CHECKING, foreground="#1565c0")
-        self.tree.tag_configure(UNCHECKED, foreground="#555555")
-        self.tree.tag_configure("dup", background="#fff1c4")
+        self._retint_tree()
+        self.tree.tag_configure("remembered", font=self._italic_font)   # result from an earlier session
+        self.tree.tag_configure("changed", font=self._bold_font)        # other result than last time
 
         self.cmenu = tk.Menu(self, tearoff=0)
         self.cmenu.add_command(label="▶ Play", command=self.play_selected)
@@ -2394,6 +3208,15 @@ class App(tk.Tk):
         self.tree.bind("<Double-1>", lambda e: self.play_selected())
         self.tree.bind("<Return>", lambda e: self.play_selected())
 
+    @staticmethod
+    def _section_title(parent, title: str, hint: str = "") -> ttk.Frame:
+        """Bold section name with a short grey hint next to it."""
+        f = ttk.Frame(parent)
+        ttk.Label(f, text=title, style="Section.TLabel").pack(side="left")
+        if hint:
+            ttk.Label(f, text=hint, style="Muted.TLabel").pack(side="left", padx=(8, 0))
+        return f
+
     def _bind_keys(self):
         def main_window_only(fn):
             # not while a dialog (rename, save, file dialog...) is open, and only for the main window
@@ -2419,6 +3242,25 @@ class App(tk.Tk):
                          (("<Escape>",), self.stop_check)):
             for k in keys:
                 self.bind_all(k, main_window_only(fn))
+        def undo_key(e):
+            try:
+                w = str(e.widget)
+                typing = self.tk.call("winfo", "class", w) in TEXT_FIELD_CLASSES and not (
+                    self.tk.call("winfo", "class", w) == "TCombobox" and self.tk.call(w, "instate", "readonly"))
+                if str(self.tk.call("grab", "current")) or \
+                        str(self.tk.call("winfo", "toplevel", w)) != "." or typing:
+                    return None               # a dialog is open, or typing in the search field
+            except tk.TclError:
+                return None
+            letter = self._ctrl_letter(e)
+            if letter == "z":
+                self.redo() if e.state & 0x0001 else self.undo()    # Ctrl+Shift+Z = redo
+            elif letter == "y":
+                self.redo()
+            else:
+                return None
+            return "break"
+        self.bind_all("<Control-KeyPress>", undo_key, add="+")
         self.tree.bind("<Control-a>", lambda e: (self.select_all(), "break")[1])
         self.tree.bind("<Delete>", lambda e: self.delete_selected())
         self.tree.bind("<F2>", lambda e: self.rename_channel())
@@ -2688,6 +3530,7 @@ class App(tk.Tk):
                 c.url = with_login(urllib.parse.urljoin(base_url or source_base, c.url), source_base)
             self.uid_counter += 1
             c.uid = self.uid_counter
+            self._apply_remembered(c)
             self.channels.append(c)
             self.by_uid[c.uid] = c
             self._source_index(c.source)
@@ -2695,6 +3538,83 @@ class App(tk.Tk):
                 self.group_enabled[c.group] = self._initial_group_state(c.group)
                 self.group_order.append(c.group)
         return len(chans)
+
+    def _apply_remembered(self, c: Channel) -> bool:
+        """Show the result of the last check of this stream (an earlier session), if there is one."""
+        if not self.v_remember_results.get() or c.status != UNCHECKED:
+            return False
+        ua = self.v_ua.get().strip()
+        e = self._results.get(c.result_key(ua))
+        if not e:
+            return False
+        c.status, c.info, c.latency, c.quality, c.checked_at = e[0], e[1], e[2], e[3], float(e[4])
+        c.checked_ua = ua
+        c.remembered = True
+        self._restored_results.append(c.checked_at)
+        return True
+
+    def _result_key(self, c: Channel) -> str:
+        """Key of c's remembered result, with the Settings User-Agent its check really used
+        (Settings -> User-Agent may have been changed since)."""
+        return c.result_key(self.v_ua.get() if c.checked_ua is None else c.checked_ua)
+
+    def _store_results(self):
+        """Remember the results found in this session (Settings -> Remember check results)."""
+        if not self.v_remember_results.get():
+            return
+        changed = False
+        for c in self.channels:
+            if (c.status in FINAL_STATUSES and c.checked_at and not c.remembered
+                    and c.checked_at > self._results_forgotten_at):
+                entry = [c.status, c.info[:300], c.latency, c.quality, round(c.checked_at)]
+                key = self._result_key(c)
+                if self._results.get(key) != entry:
+                    self._results[key] = entry
+                    changed = True
+        if changed:
+            save_results(self._results)
+
+    def on_remember_results(self):
+        if self.v_remember_results.get():
+            self._results = load_results()
+            self._store_results()
+            self.set_status("Check results will be remembered and shown again when you open the same streams.")
+        else:
+            self.set_status("Check results are no longer remembered (the ones already stored are kept – "
+                            "Settings → Forget remembered check results deletes them).")
+        self.save_settings()
+
+    def forget_results(self):
+        n = len(self._results) or len(load_results())
+        if not n:
+            messagebox.showinfo(APP_TITLE, "No check results are remembered.", parent=self)
+            return
+        if not messagebox.askyesno(APP_TITLE, f"Forget the remembered results of {n} streams?\n\n"
+                                              "Channels in the list that show a remembered result "
+                                              "(in italics) become “not checked”. Results found in "
+                                              "this session stay in the list but are not remembered; "
+                                              "only checks made from now on are.", parent=self):
+            return
+        self._results = {}
+        self._results_forgotten_at = time.time()
+        failed = ""
+        try:
+            RESULTS_FILE.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            failed = " (the results file could not be deleted)"
+            messagebox.showwarning(
+                APP_TITLE, f"Could not delete the remembered results file:\n{RESULTS_FILE}\n\n{e}\n\n"
+                           "The current list is cleared, but the old file may be loaded again next time.",
+                parent=self)
+        for c in self.channels:
+            if c.remembered:
+                c.status, c.info, c.latency, c.quality, c.checked_at = UNCHECKED, "", None, None, 0.0
+                c.remembered, c.prev_status, c.checked_ua = False, None, None
+        self.recompute_duplicates()
+        self.refresh_all()
+        self.set_status(f"Forgot the remembered results of {n} streams{failed}.")
 
     def after_load(self, added: int, check_also: int = 0, defer_check: bool = False):
         """added: new channels. check_also: channels added (and reported) earlier that still wait for
@@ -2724,6 +3644,11 @@ class App(tk.Tk):
             parts = ([f"{restored_g} group{'s' if restored_g != 1 else ''}"] if restored_g else []) + \
                     ([f"{restored_p} playlist{'s' if restored_p != 1 else ''}"] if restored_p else [])
             text += f" {' and '.join(parts)} unticked as you left them last time."
+        if self._restored_results:
+            n, newest = len(self._restored_results), max(self._restored_results)
+            text += (f" Last results shown for {n} channel{'s' if n != 1 else ''} (in italics, newest "
+                     f"{age_text(time.time() - newest)}).")
+            self._restored_results.clear()
         self.set_status(text)
 
     def _reset_view_filters(self) -> bool:
@@ -2746,10 +3671,15 @@ class App(tk.Tk):
             self._suppress_group_select = self._suppress_source_select = False
         return changed
 
+    @staticmethod
+    def _not_checked_now(c: Channel) -> bool:
+        """Not checked in this session (a remembered result from an earlier one does not count)."""
+        return c.status == UNCHECKED or c.remembered
+
     def _auto_check(self):
         if self.checking or self.downloading:
             return
-        new = [c for c in self.channels if c.status == UNCHECKED and self._included(c)]
+        new = [c for c in self.channels if self._not_checked_now(c) and self._included(c)]
         if new:
             self.start_check(new)
 
@@ -2796,11 +3726,17 @@ class App(tk.Tk):
         checker = StreamChecker(timeout, self.v_ua.get().strip(), self.v_deep.get(), self.v_ssl.get(),
                                 self.v_geo_server.get(), self.v_geo_loop.get(), self.ffmpeg if pictures else None)
         self._checker = checker
+        self._check_ua = checker.ua           # results are remembered with the User-Agent they were found with
         jobs = []
         self._recheck = {c.uid for c in targets} if recheck else None
         self._previous = {c.uid: (c.status, c.info, c.latency) for c in targets}  # restored if stopped
         for c in targets:
             if not pictures_only:
+                # what this channel was before, to show "was online 2 days ago" if it changes
+                if c.status in FINAL_STATUSES and c.checked_at:
+                    c.prev_status, c.prev_time = c.status, c.checked_at
+                else:
+                    c.prev_status = None
                 c.status, c.info, c.latency = CHECKING, "", None
                 c.seg_hash = None
                 c.audio = False
@@ -2848,13 +3784,14 @@ class App(tk.Tk):
             _, _, _, ua, ref = by_uid[uid]
             url, hls = pic_src[uid]
             if stop.is_set():
-                return uid, None, False
+                return uid, None, False, None
             pic = checker.grab_picture(url, ua, ref, hls)
+            vq = checker.video_quality()
             black = False
             # black and still can also be a fade-out or a dark scene: look again a bit later
             if black_check and looks_black(pic) and not stop.wait(STILL_CHECK_GAP):
                 black = still_black(pic, checker.grab_picture(url, ua, ref, hls))
-            return uid, pic, black
+            return uid, pic, black, vq
 
         def wants_picture(uid, res) -> bool:
             if not pictures or res is None or res[0] != ONLINE or res[3].get("audio"):
@@ -2866,7 +3803,7 @@ class App(tk.Tk):
         pic_ex = ThreadPoolExecutor(max_workers=min(16, max(4, threads // 2))) if pictures else None
         pic_futs: set = set()
 
-        pic_finished: dict[str, tuple] = {}      # address -> (picture already taken, black screen)
+        pic_finished: dict[str, tuple] = {}      # address -> (picture, black screen, video quality)
 
         def queue_picture(uid, extra=None):
             extra = extra or {}
@@ -2894,13 +3831,13 @@ class App(tk.Tk):
                 pic_futs -= done
             for f in done:
                 try:
-                    uid, pic, black = f.result()
+                    uid, pic, black, vq = f.result()
                 except Exception:
                     continue
                 key = norm_url(pic_src[uid][0])
-                pic_finished[key] = (pic, black)
+                pic_finished[key] = (pic, black, vq)
                 for same_uid in pic_same.get(key, [uid]):
-                    self.q.put(("picture", same_uid, pic, black))
+                    self.q.put(("picture", same_uid, pic, black, vq))
 
         def post(uid, res):
             self.q.put(("result", uid, res))
@@ -3013,6 +3950,7 @@ class App(tk.Tk):
                                         value=int(d.get("done", 0)))
         self.recompute_duplicates()
         self.refresh_all()
+        self._store_results()
         # keep what happened during this check, so the statistics can be rebuilt after the
         # same-picture question marks more channels as geo-blocked
         self._finish_stopped = stopped
@@ -3034,7 +3972,7 @@ class App(tk.Tk):
             self._thumbs.clear()
         if self._pending_check and not stopped:
             self._pending_check = False
-            if any(c.status == UNCHECKED and self._included(c) for c in self.channels):
+            if any(self._not_checked_now(c) and self._included(c) for c in self.channels):
                 self.after(400, self._check_added)
                 return
         self._pending_check = False
@@ -3069,6 +4007,9 @@ class App(tk.Tk):
         if self._finish_retry:
             back, tried = self._finish_retry
             text += f" {back} of {tried} channels with a temporary error worked on the 2nd try."
+        changed = sum(1 for c in self.channels if c.changed)
+        if changed:
+            text += f" {changed} changed since the last check (bold – Show → “{SHOW_CHANGED}”)."
         return text
 
     # ------------------------------------------------------------------ geo-blocked channels
@@ -3102,6 +4043,7 @@ class App(tk.Tk):
         d = self._learned()
         if c.seg_hash and c.seg_hash in d["segs"]:
             c.status, c.info = BLOCKED, "same 'not available' video as a channel you marked"
+            c.checked_at, c.remembered, c.quality = time.time(), False, None
             return True
         # a banner can have a small animation (a blinking "live" dot, a moving logo): the
         # fingerprint and colours still match, so do not reject it just because it moves a little
@@ -3111,6 +4053,7 @@ class App(tk.Tk):
                 if self._entry_close(c, e):
                     name = e[2] if len(e) > 2 and isinstance(e[2], str) else "?"
                     c.status, c.info = BLOCKED, f"shows the 'not available' banner (like “{name}”)"
+                    c.checked_at, c.remembered, c.quality = time.time(), False, None
                     return True
         return False
 
@@ -3144,12 +4087,15 @@ class App(tk.Tk):
         need_picture = []
         for c in sel:
             c.status, c.info = BLOCKED, "marked by you: 'not available in this country'"
+            c.checked_at, c.remembered, c.quality = time.time(), False, None
+            c.checked_ua = self.v_ua.get().strip() or DEFAULT_UA   # remember it with the UA in use now
             if self.checking:                 # the running check must not overwrite this mark
                 self._manual_locked.add(c.uid)
             if not self._learn(c):
                 need_picture.append(c)
         self.save_settings()
         others = self._apply_learned_to_all()
+        self._store_results()                 # the new “geo-blocked” results are remembered at once
         msg = f"Marked {len(sel)} channel(s) as geo-blocked."
         if others:
             msg += f" {others} other channel(s) show the same banner and were marked too."
@@ -3187,6 +4133,7 @@ class App(tk.Tk):
         self._learn(c)
         self.save_settings()
         n = self._apply_learned_to_all()
+        self._store_results()             # the channels marked from the learned picture are remembered
         self.set_status(f"Learned the banner of “{c.name}”." +
                         (f" {n} other channel(s) show it and were marked as geo-blocked." if n else
                          " Channels showing it will be marked as geo-blocked in the next checks."))
@@ -3205,13 +4152,26 @@ class App(tk.Tk):
                                                       ([c.pic_colors] if c.pic_colors else [])])[-300:]
             if c.seg_hash in d["segs"]:
                 d["segs"].remove(c.seg_hash)
-            c.status, c.info = UNCHECKED, ""
+            c.status, c.info, c.latency, c.quality, c.checked_at = UNCHECKED, "", None, None, 0.0
+            c.remembered = False
             if self.checking:                 # the running check must not overwrite this change
                 self._manual_locked.add(c.uid)
+        self._forget_saved_results(sel)
+        for c in sel:                         # the old UA must not be used for a later result
+            c.checked_ua = None
         self.save_settings()
         self.refresh_all()
         if not self.checking:
             self.start_check(sel)
+
+    def _forget_saved_results(self, chans: list[Channel]):
+        """Drop the remembered results of these channels (the user unmarked them as geo-blocked)."""
+        results = self._results if self.v_remember_results.get() else load_results()
+        removed = False
+        for c in chans:
+            removed = results.pop(self._result_key(c), None) is not None or removed
+        if removed:
+            save_results(results)
 
     def forget_banners(self):
         d = self._learned()
@@ -3247,7 +4207,8 @@ class App(tk.Tk):
                                 "    sudo apt install ffmpeg", parent=self)
             return
         targets = [c for c in self.channels if c.status == ONLINE and self._included(c)
-                   and not c.audio and not AUDIO_URL_RE.search(c.url)
+                   and not c.audio and not (c.quality or {}).get("audio")
+                   and not AUDIO_URL_RE.search(c.url)
                    and c.url.lower().startswith(("http://", "https://", "rtmp", "rtsp"))]
         if not targets:
             messagebox.showinfo(APP_TITLE, "There are no online video channels to check – radio / audio "
@@ -3261,7 +4222,8 @@ class App(tk.Tk):
             messagebox.showinfo(APP_TITLE, "No geo-blocked channels.", parent=self)
             return
         if messagebox.askyesno(APP_TITLE, f"Remove {len(blk)} geo-blocked channels from the list?", parent=self):
-            self._remove(blk)
+            with self._undoable(f"Remove {len(blk)} geo-blocked channels"):
+                self._remove(blk)
             self.set_status(f"Removed {len(blk)} geo-blocked channels.")
 
     def _same_picture_groups(self):
@@ -3377,6 +4339,8 @@ class App(tk.Tk):
                 if answer == "block":
                     for m in members:
                         m.status, m.info = BLOCKED, "same picture as other channels ('not available' banner)"
+                        m.checked_at, m.remembered, m.quality = time.time(), False, None
+                        m.checked_ua = getattr(self, "_check_ua", None) or m.checked_ua
                     # the same picture can't be "a banner" and "not a banner" at the same time
                     d["rejected"] = [r for r in d["rejected"] if not self._entry_close(first, r)]
                     d["pics"] = (d["pics"] + [[h, round(g, 1), first.name[:60]] + cols])[-300:]
@@ -3387,6 +4351,7 @@ class App(tk.Tk):
             if groups:
                 self.save_settings()
                 marked += self._apply_learned_to_all()
+                self._store_results()             # the dialog's “geo-blocked” answers are remembered
                 if marked:
                     # keep the full playlist statistics in the status bar; the counts changed
                     # because the channels above were just marked as geo-blocked
@@ -3401,7 +4366,7 @@ class App(tk.Tk):
 
     def _check_added(self):
         """Continue with the playlists that were opened while the previous check was running."""
-        targets = [c for c in self.channels if c.status == UNCHECKED and self._included(c)]
+        targets = [c for c in self.channels if self._not_checked_now(c) and self._included(c)]
         if targets and not self.checking:
             self.start_check(targets)
             self.set_status(f"Checking {len(targets)} channels added during the previous check …")
@@ -3448,10 +4413,15 @@ class App(tk.Tk):
                     # a channel marked by the user during this check keeps that status
                     if c is not None and msg[2] is not None and c.uid not in self._manual_locked:
                         c.status, c.info, c.latency, extra = msg[2]
+                        c.checked_at, c.remembered = time.time(), False
+                        c.checked_ua = getattr(self, "_check_ua", None)
                         c.seg_hash = extra.get("seg_hash")
                         c.audio = bool(extra.get("audio"))
                         c.pic_src = (extra["pic_url"], bool(extra.get("pic_hls"))) if extra.get("pic_url") \
                             else None
+                        # quality of a working stream only (a banner's resolution means nothing);
+                        # a picture taken later fills it in for streams the server did not describe
+                        c.quality = extra.get("quality") if c.status == ONLINE else None
                         self._apply_learned(c)
                         self._update_row(c)
                     self.check_done += 1
@@ -3469,6 +4439,18 @@ class App(tk.Tk):
                 elif kind == "picture":
                     c = self.by_uid.get(msg[1])
                     black = len(msg) > 3 and msg[3]
+                    vq = msg[4] if len(msg) > 4 else None
+                    if c is not None and vq and c.status == ONLINE \
+                            and not (c.quality or {}).get("h") and not (c.quality or {}).get("audio"):
+                        # an HLS master playlist names its best quality (+ bitrate); ffmpeg opened the
+                        # lowest one - so ffmpeg only fills in what the playlist did not say
+                        q = c.quality or {}
+                        several = q.get("src") == "hls" and q.get("variants", 1) > 1
+                        c.quality = {**vq, "bw": q.get("bw", 0), "codec": q.get("codec") or vq["codec"],
+                                     "fps": q.get("fps") or vq["fps"]}
+                        if several:                  # the resolution ffmpeg saw is the lowest quality
+                            c.quality.update(w=0, h=0)
+                        self._update_row(c)
                     if c is not None and msg[2] is not None:
                         c.pic_hash, c.pic_spread, c.pic_gray, thumb = msg[2][:4]
                         c.pic_motion, c.pic_colors = picture_extras(msg[2])
@@ -3477,10 +4459,14 @@ class App(tk.Tk):
                             c.status, c.info = OFFLINE, (
                                 "black screen – the stream works but shows no programme "
                                 f"(black and still, again {STILL_CHECK_GAP} s later)")
+                            c.checked_at, c.remembered = time.time(), False
+                            c.checked_ua = getattr(self, "_check_ua", None) or c.checked_ua
+                            c.quality = None
                         elif self._banner_pics:
                             if c.pic_spread >= PIC_MIN_SPREAD and not is_moving(c):
                                 self._thumbs[c.uid] = thumb   # only a still picture can be a banner
-                            self._apply_learned(c)
+                            if self._apply_learned(c):
+                                c.checked_ua = getattr(self, "_check_ua", None) or c.checked_ua
                         self._update_row(c)
                     self.pic_done += 1
                     updated = True
@@ -3518,6 +4504,102 @@ class App(tk.Tk):
         self.refresh_groups()
         self.refresh_channels()
 
+    # ------------------------------------------------------------------ undo / redo
+    def _list_state(self) -> dict:
+        """Copy of everything an edit can change (the channel objects themselves are copied shallowly:
+        edits replace their name / group, they never change the tvg attributes in place)."""
+        return {"channels": [copy.copy(c) for c in self.channels], "header": dict(self.header),
+                "group_enabled": dict(self.group_enabled), "group_order": list(self.group_order),
+                "source_enabled": dict(self.source_enabled), "source_color": dict(self.source_color),
+                "current_group": self.current_group, "current_source": self.current_source,
+                "counter": self.uid_counter}
+
+    def _list_signature(self) -> tuple:
+        return (tuple((c.uid, c.name, c.group) for c in self.channels), tuple(self.group_order),
+                tuple(sorted(self.group_enabled.items())), tuple(sorted(self.source_enabled.items())))
+
+    class _Undoable:
+        """with self._undoable("Delete 3 channels"): ...  - remembers the list as it was, if it changes."""
+
+        def __init__(self, app, label):
+            self.app, self.label = app, label
+
+        def __enter__(self):
+            self.state = self.app._list_state()
+            self.sig = self.app._list_signature()
+            return self
+
+        def __exit__(self, exc_type, *_):
+            if exc_type is None and self.app._list_signature() != self.sig:
+                self.state["label"] = self.label
+                self.state["counter_after"] = self.app.uid_counter
+                self.app._undo.append(self.state)
+                self.app._redo.clear()
+                self.app._trim_undo()
+            return False
+
+    def _undoable(self, label: str) -> "App._Undoable":
+        return App._Undoable(self, label)
+
+    def _trim_undo(self):
+        while len(self._undo) > UNDO_MAX_STEPS or (
+                len(self._undo) > 1 and sum(len(u["channels"]) for u in self._undo) > UNDO_MAX_CHANNELS):
+            self._undo.pop(0)
+
+    def undo(self):
+        self._undo_redo(self._undo, self._redo, "Undone")
+
+    def redo(self):
+        self._undo_redo(self._redo, self._undo, "Redone")
+
+    def _undo_redo(self, source: list, target: list, verb: str):
+        if not source:
+            self.set_status("Nothing to " + verb[:-2].lower() + ".")
+            return
+        entry = source.pop()
+        now = self._list_state()
+        now["label"], now["counter_after"] = entry["label"], self.uid_counter
+        target.append(now)
+        self._restore_list(entry)
+        self.set_status(f"{verb}: {entry['label']}.")
+
+    def _restore_list(self, st: dict):
+        current = {c.uid: c for c in self.channels}
+        restored = []
+        for old in st["channels"]:
+            c = copy.copy(old)
+            cur = current.get(c.uid)
+            if cur is not None:          # keep what a check found out since then
+                for f in CHECK_FIELDS:
+                    setattr(c, f, getattr(cur, f))
+            elif c.status == CHECKING:   # removed while its check ran: that check was stopped
+                c.status, c.info, c.latency = self._previous.get(c.uid, (UNCHECKED, "", None))
+            restored.append(c)
+        # channels loaded AFTER the change (playlist downloads, opened files) are not part of it: keep them
+        later = [c for c in self.channels if c.uid > st["counter_after"]]
+        self.channels = restored + later
+        self.by_uid = {c.uid: c for c in self.channels}
+        self.header = dict(st["header"]) if st["header"] or not later else self.header
+        self.group_enabled, self.group_order = dict(st["group_enabled"]), list(st["group_order"])
+        self.source_enabled, self.source_color = dict(st["source_enabled"]), dict(st["source_color"])
+        for c in later:
+            if c.group not in self.group_enabled:
+                self.group_enabled[c.group] = self._initial_group_state(c.group)
+                self.group_order.append(c.group)
+            self._source_index(c.source)
+        self.current_group = st["current_group"] if st["current_group"] in self.group_enabled else None
+        self.current_source = st["current_source"] if st["current_source"] in self.source_enabled else None
+        self._manual_locked &= set(self.by_uid)
+        self._remember_ticks()
+        self.recompute_duplicates()
+        self.refresh_all()
+
+    def _edit_menu_post(self, menu: tk.Menu):
+        """Edit menu: 'Undo delete 3 channels' / 'Redo …', greyed out when there is nothing."""
+        for i, stack, word in ((0, self._undo, "Undo"), (1, self._redo, "Redo")):
+            label = word + (" " + stack[-1]["label"][:1].lower() + stack[-1]["label"][1:] if stack else "")
+            menu.entryconfigure(i, label=label, state="normal" if stack else "disabled")
+
     def _debounced_refresh(self):
         if self._search_job:
             self.after_cancel(self._search_job)
@@ -3527,8 +4609,14 @@ class App(tk.Tk):
         info = c.info
         if c.status == ONLINE and c.latency is not None:
             info += f" · {c.latency} ms"
+        if c.remembered and c.checked_at:
+            info = f"last check {age_text(time.time() - c.checked_at)}: {info}"
+        elif c.changed:
+            # first, so it is visible even in a narrow column
+            info = f"was {STATUS_WORD.get(c.prev_status, c.prev_status)} {age_text(time.time() - c.prev_time)} · {info}"
         dup = f"{c.dup_reason} as #{c.dup_of}" if c.dup_of else ""
-        return (c.uid, STATUS_TEXT[c.status], vis(c.name), vis(c.group or NO_GROUP), vis(info), dup,
+        return (c.uid, STATUS_TEXT[c.status], vis(c.name), vis(c.group or NO_GROUP), quality_text(c.quality),
+                vis(info), dup,
                 ("▶  " if self.v_click_play.get() else "") + vis(c.url),
                 vis(self._source_labels.get(c.source, short_source(c.source))))
 
@@ -3542,6 +4630,10 @@ class App(tk.Tk):
             tags.append("excluded")
         if c.dup_of:
             tags.append("dup")                # created first, so its yellow wins over the playlist tint
+        if c.remembered:
+            tags.append("remembered")
+        elif c.changed:
+            tags.append("changed")
         if self.v_tint.get():
             tags.append(self._source_tag(c.source))
         return tuple(tags)
@@ -3558,7 +4650,7 @@ class App(tk.Tk):
         i = self._source_index(src)
         tag = f"src{i}"
         if tag not in self._swatch_images.get("_tags", ()):  # configure each tint once (after "dup")
-            self.tree.tag_configure(tag, background=PLAYLIST_COLORS[i][1])
+            self.tree.tag_configure(tag, background=playlist_tint(i))
             self._swatch_images.setdefault("_tags", set()).add(tag)
         return tag
 
@@ -3591,6 +4683,8 @@ class App(tk.Tk):
             return False
         if show == "Duplicates" and not c.dup_of:
             return False
+        if show == SHOW_CHANGED and not c.changed:
+            return False
         if show == "Geo-blocked" and c.status != BLOCKED:
             return False
         if show.startswith("Problems") and not (c.status in (OFFLINE, BLOCKED) or c.dup_of):
@@ -3601,7 +4695,8 @@ class App(tk.Tk):
             return False
         if show.startswith("Excluded") and self._included(c):
             return False
-        if q and q not in c.name.casefold() and q not in c.url.casefold() and q not in c.group.casefold():
+        if q and q not in c.name.casefold() and q not in c.url.casefold() and q not in c.group.casefold() \
+                and q not in quality_text(c.quality).casefold():      # "1080p", "h.265", "mp3" ...
             return False
         return True
 
@@ -3611,6 +4706,7 @@ class App(tk.Tk):
             "status": lambda c: (STATUS_RANK[c.status], c.uid),
             "name": lambda c: natural_key(c.name),
             "group": lambda c: (natural_key(c.group), c.uid),
+            "quality": lambda c: (quality_rank(c.quality), c.uid),
             "info": lambda c: (c.latency if c.status == ONLINE and c.latency is not None else 10 ** 9, c.info),
             "dup": lambda c: (c.dup_of is None, c.dup_of or 0, c.uid),
             "url": lambda c: c.url.casefold(),
@@ -3819,8 +4915,10 @@ class App(tk.Tk):
             row = self.ptree.identify_row(e.y)
             if row.startswith("s:"):
                 src = row[2:]
-                self.source_enabled[src] = not self.source_enabled.get(src, True)
                 name = self._source_labels.get(src, src)
+                with self._undoable(("Untick" if self.source_enabled.get(src, True) else "Tick") +
+                                    f" playlist “{name}”"):
+                    self.source_enabled[src] = not self.source_enabled.get(src, True)
                 self._inclusion_changed(f"Playlist “{name}” " + ("included" if self.source_enabled[src] else "excluded"))
                 return "break"
         return None
@@ -3848,7 +4946,8 @@ class App(tk.Tk):
         return None
 
     def toggle_group(self, g):
-        self.group_enabled[g] = not self.group_enabled.get(g, True)
+        with self._undoable(("Untick" if self.group_enabled.get(g, True) else "Tick") + f" group “{g or NO_GROUP}”"):
+            self.group_enabled[g] = not self.group_enabled.get(g, True)
         self._inclusion_changed(f"Group “{g or NO_GROUP}” " + ("included" if self.group_enabled[g] else "excluded"))
 
     def toggle_selected_group(self):
@@ -3857,8 +4956,9 @@ class App(tk.Tk):
             self.toggle_group(g)
 
     def set_all_groups(self, value: bool):
-        for g in self.group_order:
-            self.group_enabled[g] = value
+        with self._undoable("Tick all groups" if value else "Untick all groups"):
+            for g in self.group_order:
+                self.group_enabled[g] = value
         self._inclusion_changed("All groups " + ("included" if value else "excluded"))
 
     def move_group(self, step: int):
@@ -3868,7 +4968,8 @@ class App(tk.Tk):
         i = self.group_order.index(g)
         j = i + step
         if 0 <= j < len(self.group_order):
-            self.group_order[i], self.group_order[j] = self.group_order[j], self.group_order[i]
+            with self._undoable(f"Move group “{g or NO_GROUP}” {'up' if step < 0 else 'down'}"):
+                self.group_order[i], self.group_order[j] = self.group_order[j], self.group_order[i]
             self.refresh_groups()
             self.gtree.see("g:" + g)
 
@@ -3884,15 +4985,16 @@ class App(tk.Tk):
         if not new or new == g:
             return
         merging = new in self.group_enabled
-        for c in self.channels:
-            if c.group == g:
-                c.group = new
-        if merging:
-            self.group_order.remove(g)
-        else:
-            self.group_order[self.group_order.index(g)] = new
-            self.group_enabled[new] = self.group_enabled.get(g, True)
-        self.group_enabled.pop(g, None)
+        with self._undoable(f"{'Merge' if merging else 'Rename'} group “{g or NO_GROUP}”"):
+            for c in self.channels:
+                if c.group == g:
+                    c.group = new
+            if merging:
+                self.group_order.remove(g)
+            else:
+                self.group_order[self.group_order.index(g)] = new
+                self.group_enabled[new] = self.group_enabled.get(g, True)
+            self.group_enabled.pop(g, None)
         self._remember_ticks()
         self.current_group = new
         self.recompute_duplicates()
@@ -3938,7 +5040,8 @@ class App(tk.Tk):
         c = sel[0]
         new = TextDialog(self, "Rename channel", "Channel name:", c.name).result
         if new and new.strip():
-            c.name = new.strip()
+            with self._undoable(f"Rename “{c.name}”"):
+                c.name = new.strip()
             self.recompute_duplicates()
             self.refresh_channels()
 
@@ -3953,11 +5056,12 @@ class App(tk.Tk):
         if dlg.result is None:
             return
         new = dlg.result
-        for c in sel:
-            c.group = new
-        if new not in self.group_enabled:
-            self.group_enabled[new] = self._initial_group_state(new)
-            self.group_order.append(new)
+        with self._undoable(f"Move {len(sel)} channel(s) to “{new or NO_GROUP}”"):
+            for c in sel:
+                c.group = new
+            if new not in self.group_enabled:
+                self.group_enabled[new] = self._initial_group_state(new)
+                self.group_order.append(new)
         self.refresh_all()
         self.set_status(f"Moved {len(sel)} channel(s) to “{new or NO_GROUP}”.")
 
@@ -3975,16 +5079,24 @@ class App(tk.Tk):
             return
         if len(sel) > 1 and not messagebox.askyesno(APP_TITLE, f"Delete {len(sel)} channels from the list?", parent=self):
             return
-        self._remove(sel)
-        self.set_status(f"Deleted {len(sel)} channel(s).")
+        with self._undoable(f"Delete {len(sel)} channel(s)"):
+            self._remove(sel)
+        self.set_status(f"Deleted {len(sel)} channel(s).  (Ctrl+Z to undo)")
 
     def remove_offline(self):
-        off = [c for c in self.channels if c.status == OFFLINE]
+        off = [c for c in self.channels if current_status(c) == OFFLINE]
+        old = sum(1 for c in self.channels if c.remembered and c.status == OFFLINE)
+        note = (f"\n\n{old} channel{'s' if old != 1 else ''} showing “offline” from an earlier session "
+                f"(in italics) {'are' if old != 1 else 'is'} kept – that result may be out of date. "
+                f"“Recheck offline” checks {'them' if old != 1 else 'it'} again.") if old else ""
         if not off:
-            messagebox.showinfo(APP_TITLE, "No offline channels (run “Check streams” first).", parent=self)
+            messagebox.showinfo(APP_TITLE, "No channels were found offline in this session "
+                                           "(run “Check streams” first)." + note, parent=self)
             return
-        if messagebox.askyesno(APP_TITLE, f"Remove {len(off)} offline channels from the list?", parent=self):
-            self._remove(off)
+        if messagebox.askyesno(APP_TITLE, f"Remove {len(off)} offline channels from the list?" + note,
+                               parent=self):
+            with self._undoable(f"Remove {len(off)} offline channels"):
+                self._remove(off)
             self.set_status(f"Removed {len(off)} offline channels.")
 
     def remove_duplicates(self):
@@ -3994,7 +5106,8 @@ class App(tk.Tk):
             return
         if messagebox.askyesno(APP_TITLE, f"Remove {len(dups)} duplicates from the list?\n"
                                           "(the online / first copy of each channel stays)", parent=self):
-            self._remove(dups)
+            with self._undoable(f"Remove {len(dups)} duplicates"):
+                self._remove(dups)
             self.set_status(f"Removed {len(dups)} duplicates.")
 
     # ------------------------------------------------------------------ clipboard
@@ -4030,6 +5143,10 @@ class App(tk.Tk):
         if not text.strip():
             self.set_status("The clipboard is empty.")
             return
+        with self._undoable("Paste channels"):
+            self._paste_text(text)
+
+    def _paste_text(self, text: str):
         group = self.current_group or ""
         if "#EXTINF" in text.upper() or text.lstrip("\ufeff \t\r\n").upper().startswith("#EXTM3U"):
             playlist = text
@@ -4370,9 +5487,9 @@ class App(tk.Tk):
     # ------------------------------------------------------------------ saving
     def select_for_export(self, o: dict) -> list[Channel]:
         items = [c for c in self.channels
-                 if not (o["drop_offline"] and c.status == OFFLINE)
+                 if not (o["drop_offline"] and current_status(c) == OFFLINE)
                  and not (o.get("drop_blocked", True) and c.status == BLOCKED)
-                 and not (o["drop_unchecked"] and c.status in (UNCHECKED, CHECKING))
+                 and not (o["drop_unchecked"] and current_status(c) in (UNCHECKED, CHECKING))
                  and not (o["only_enabled_groups"] and not self.group_enabled.get(c.group, True))
                  and not (o["only_enabled_groups"] and not self.source_enabled.get(c.source, True))]
         if o["drop_dups"]:
@@ -4393,11 +5510,15 @@ class App(tk.Tk):
         if self.checking:
             messagebox.showinfo(APP_TITLE, "Wait until the check finishes (or press Stop).", parent=self)
             return
-        on = sum(c.status == ONLINE for c in self.channels)
-        off = sum(c.status == OFFLINE for c in self.channels)
+        on = sum(current_status(c) == ONLINE for c in self.channels)
+        off = sum(current_status(c) == OFFLINE for c in self.channels)
         dups = sum(1 for c in self.channels if c.dup_of)
         included = sum(1 for c in self.channels if self._included(c))
         summary = f"{len(self.channels)} channels:  {on} online · {off} offline · {dups} duplicates"
+        old = sum(1 for c in self.channels if current_status(c) != c.status)
+        if old:
+            summary += (f"\n{old} show a result from an earlier session (in italics) – "
+                        "counted as not checked")
         if included != len(self.channels):
             summary += f"\n{included} in ticked groups and playlists"
         opts = ExportDialog(self, summary, self.settings.get("export")).result
@@ -4492,11 +5613,18 @@ class App(tk.Tk):
         try:
             with open(path, "w", newline="", encoding="utf-8-sig") as f:
                 w = csv.writer(f)
-                w.writerow(["#", "Status", "Check result", "Response ms", "Duplicate", "Channel", "Group", "URL", "Playlist"])
+                w.writerow(["#", "Status", "Check result", "Response ms", "Quality", "Duplicate", "Channel", "Group",
+                            "URL", "Playlist", "Checked (local time)"])
                 for c in self.channels:
+                    checked = (time.strftime("%Y-%m-%d %H:%M", time.localtime(c.checked_at))
+                               if c.checked_at else "")
+                    if checked and c.remembered:
+                        checked += " (earlier session)"
                     w.writerow([c.uid, c.status, csv_text(c.info), c.latency if c.status == ONLINE else "",
+                                quality_text(c.quality),
                                 f"{c.dup_reason} as #{c.dup_of}" if c.dup_of else "",
-                                csv_text(c.name), csv_text(c.group), csv_text(c.url), csv_text(c.source)])
+                                csv_text(c.name), csv_text(c.group), csv_text(c.url), csv_text(c.source),
+                                checked])
             self.set_status(f"Report saved: {path}")
         except OSError as e:
             messagebox.showerror(APP_TITLE, f"Could not save:\n{e}", parent=self)
@@ -4697,6 +5825,14 @@ class App(tk.Tk):
     def clear_all(self):
         if self.channels and not messagebox.askyesno(APP_TITLE, "Clear the whole list?", parent=self):
             return
+        if self.channels:
+            with self._undoable(f"Clear the list ({len(self.channels)} channels)"):
+                self._clear_list()
+            self.set_status("List cleared.  (Ctrl+Z brings it back)")
+        else:
+            self._clear_list()
+
+    def _clear_list(self):
         self.stop_event.set()
         self._dl_stop.set()
         self._dl_gen += 1                     # results of downloads still running are ignored
@@ -4728,7 +5864,8 @@ class App(tk.Tk):
             "3. Groups on the left: click a group to see its channels; click ☑ to exclude it; "
             "▲ ▼ to reorder; Rename… to rename or merge groups.\n"
             "4. Right-click channels: play in VLC, check again, rename, move to group, delete.\n"
-            "5. “Save new playlist” writes a clean playlist (offline and duplicates removed by default). "
+            "5. “Save playlist” (File → Save new playlist, Ctrl+S) writes a clean playlist "
+            "(offline and duplicates removed by default). "
             "Logos, EPG (tvg-id, url-tvg) and VLC options are kept.\n\n"
             "Geo-blocked (⛔): channels that only show “not available in your country”. They are found by the "
             "server's answer, by short looping videos and – with ffmpeg installed – by the picture. "
@@ -4736,6 +5873,15 @@ class App(tk.Tk):
             "recognises the same banner on all other channels.\n\n"
             "Black screen: a stream that works but shows only black (maybe with the channel logo) for "
             f"{STILL_CHECK_GAP}+ seconds counts as offline – Settings → “Black screen … = offline” (needs ffmpeg).\n\n"
+            "Undo: Edit → Undo (Ctrl+Z) and Redo (Ctrl+Y) reverse deleting, removing, renaming, moving, "
+            "ticking groups, pasting and Clear list – check results are kept.\n\n"
+            "Remembered results: when you open a playlist again, each channel shows the result of its "
+            "last check (in italics, with its age) until it is checked again; after a check, channels "
+            "that changed since then are bold (Show → “Changed since the last check”). Settings → "
+            "“Remember check results between sessions”.\n\n"
+            "Quality column: resolution, codec, frame rate and bitrate of working streams (radio: format "
+            "and bitrate). It is filled during the check; for streams that don't describe themselves it "
+            "needs the picture or black-screen check (ffmpeg).\n\n"
             "Tips: some providers block unknown players – keep the VLC User-Agent. "
             "UDP/multicast links can only be tested inside your provider's network."), parent=self)
 
@@ -4755,7 +5901,7 @@ class App(tk.Tk):
         dlg.title("About")
         dlg.transient(self)
         dlg.resizable(False, False)
-        body = ttk.Frame(dlg, padding=18)
+        body = ttk.Frame(dlg, padding=20)
         body.pack(fill="both", expand=True)
         try:
             self._about_icon = tk.PhotoImage(master=dlg, data=ICON_PNGS[64])
@@ -4773,16 +5919,16 @@ class App(tk.Tk):
                   text="Checks IPTV and radio playlists for dead streams and duplicates, "
                        "organises groups and saves clean playlists.").grid(row=2, column=1, sticky="w")
 
-        ttk.Label(body, text="Project page:").grid(row=3, column=1, sticky="w", pady=(14, 0))
-        link = ttk.Label(body, text=PROJECT_URL, foreground="#1a5fb4", cursor="hand2", font=link_font)
+        ttk.Label(body, text="Project page", style="Section.TLabel").grid(row=3, column=1, sticky="w", pady=(14, 2))
+        link = ttk.Label(body, text=PROJECT_URL, foreground=UI["link"], cursor="hand2", font=link_font)
         link.grid(row=4, column=1, sticky="w")
         link.bind("<Button-1>", lambda e: self.open_link(PROJECT_URL))
-        link.bind("<Enter>", lambda e: link.configure(foreground="#0b3d91"))
-        link.bind("<Leave>", lambda e: link.configure(foreground="#1a5fb4"))
+        link.bind("<Enter>", lambda e: link.configure(foreground=UI["link_hover"]))
+        link.bind("<Leave>", lambda e: link.configure(foreground=UI["link"]))
 
         info = (f"Python {sys.version.split()[0]} · Tk {self.tk.call('info', 'patchlevel')}\n"
                 f"Settings: {SETTINGS_FILE}")
-        ttk.Label(body, text=info, foreground="#666666", justify="left").grid(row=5, column=1, sticky="w", pady=(14, 0))
+        ttk.Label(body, text=info, style="Muted.TLabel", justify="left").grid(row=5, column=1, sticky="w", pady=(14, 0))
 
         buttons = ttk.Frame(body)
         buttons.grid(row=6, column=0, columnspan=2, sticky="e", pady=(16, 0))
@@ -4794,8 +5940,8 @@ class App(tk.Tk):
         ttk.Button(buttons, text="Open project page", command=lambda: self.open_link(PROJECT_URL)).pack(side="left", padx=3)
         copy_btn = ttk.Button(buttons, text="Copy link", command=copy_link)
         copy_btn.pack(side="left", padx=3)
-        close = ttk.Button(buttons, text="Close", command=dlg.destroy)
-        close.pack(side="left", padx=3)
+        close = ttk.Button(buttons, text="Close", style="Accent.TButton", command=dlg.destroy)
+        close.pack(side="left", padx=(3, 0))
         dlg.bind("<Escape>", lambda e: dlg.destroy())
         dlg.bind("<Return>", lambda e: dlg.destroy())
         dlg.update_idletasks()
@@ -4832,7 +5978,8 @@ class App(tk.Tk):
             "replace_player": self.v_replace_player.get(), "retry_temporary": self.v_retry.get(),
             "geo_server": self.v_geo_server.get(), "geo_loop": self.v_geo_loop.get(),
             "geo_picture": self.v_geo_picture.get(), "geo_ask": self.v_geo_ask.get(),
-            "black_screen": self.v_black.get(),
+            "black_screen": self.v_black.get(), "theme": self.v_theme.get(),
+            "remember_results": self.v_remember_results.get(),
             "bidi_fix": self.v_bidi.get(), "confirm_exit": self.v_confirm_exit.get(),
             "encoding": self.v_encoding.get()})
         try:
@@ -4870,6 +6017,7 @@ class App(tk.Tk):
         for checker in list(getattr(self, "_aux_checkers", ())):
             checker.kill_all()
         self.save_settings()
+        self._store_results()                 # e.g. channels marked geo-blocked by hand
         self.destroy()
 
 

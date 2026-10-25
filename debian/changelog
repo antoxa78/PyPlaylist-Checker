@@ -1,3 +1,33 @@
+playlist-checker (1.7.0) unstable; urgency=medium
+
+  * New Quality column: resolution, codec, frame rate and bitrate of video
+    streams; audio format and bitrate for radio. HLS master playlists and
+    ffmpeg supply the information.
+  * New "Remember check results between sessions": results are shown again in
+    italics with their age. Old online / offline results count as not checked
+    when removing channels, choosing a duplicate to keep or saving a playlist.
+    Results are keyed by stream address plus the User-Agent / headers used for
+    the check and stored under hashed keys (no addresses or logins); the
+    results file is migrated from the earlier format.
+  * New Undo / Redo (Ctrl+Z, Ctrl+Y, Ctrl+Shift+Z) for deleting, removing,
+    renaming, moving, ticking groups or playlists, pasting and Clear list;
+    check results are kept.
+  * New light / dark theme (Settings -> Theme), following the system by
+    default; the toolbar, settings panels, tables and dialogs now fit better
+    on 1024x768 screens.
+  * New "Changed since the last check" Show filter and bold rows for changed
+    results.
+  * The CSV report has a Checked column. Forgotten results are not saved again
+    at exit, and a failed deletion of the results file is reported.
+  * Fixes: local playlists keep separate results for the same relative stream
+    name in different folders; damaged quality entries in results.json are
+    ignored instead of breaking the channel list; a channel removed during a
+    check is restored to its previous result by Undo; black-screen and
+    same-picture results are stored as new results with the current
+    User-Agent.
+
+ -- Anton <anton1978@gmail.com>  Sun, 25 Oct 2026 19:54:26 +0200
+
 playlist-checker (1.6.5) unstable; urgency=medium
 
   * After the "same picture on several channels" question marks channels as

@@ -1,4 +1,4 @@
-.TH PLAYLIST-CHECKER 1 "October 2026" "playlist-checker 1.6.5" "User Commands"
+.TH PLAYLIST-CHECKER 1 "October 2026" "playlist-checker 1.7.0" "User Commands"
 .SH NAME
 playlist-checker \- check IPTV and internet radio playlists for dead streams and duplicates
 .SH SYNOPSIS
@@ -11,7 +11,7 @@ playlist-checker \- check IPTV and internet radio playlists for dead streams and
 .B playlist-checker
 is a desktop application that opens TV (IPTV) and internet radio playlists in
 M3U, M3U8, PLS and XSPF format (also gzip-compressed .m3u.gz, .m3u8.gz,
-.pls.gz and .xspf.gz), from files, whole folders (including subfolders) or web
+\&.pls.gz and .xspf.gz), from files, whole folders (including subfolders) or web
 addresses, and checks every stream.
 .PP
 It recognises HTTP and HTTPS streams, HLS (it tests the real video segment),
@@ -23,7 +23,12 @@ Duplicates (same stream address, optionally same channel name) are marked.
 Groups can be included, excluded, renamed, merged and reordered. A new clean
 playlist can be saved, keeping channel logos, EPG information (tvg-id,
 url-tvg) and player options, optionally as one file per group. A CSV report of
-the check can be exported.
+the check can be exported; it includes the check time and the Quality column.
+.PP
+The channel table has a Quality column with resolution, codec, frame rate and
+bitrate of video streams (audio format and bitrate for radio). Undo / Redo
+(Ctrl+Z, Ctrl+Y), a light or dark theme and remembered check results are also
+available.
 .SH OPTIONS
 .TP
 .I PLAYLIST
@@ -77,6 +82,44 @@ installed, Settings \(-> Black screen (no programme, only a logo) = offline
 still picture twice, 8 seconds apart. Such channels are left out of the saved
 playlist. A short fade to black, a dark moving scene and a black picture with
 a changing logo are not treated as a black screen.
+.SH QUALITY
+The Quality column shows resolution, codec (H.264, H.265, VP9, AV1 and others),
+frame rate and bitrate. For an HLS master playlist the best announced quality
+is used; the picture check can fill in what a stream does not describe (needs
+.BR ffmpeg (1)).
+Radio streams show their audio format and bitrate when the server sends it.
+.SH UNDO AND REDO
+Edit \(-> Undo (Ctrl+Z) and Redo (Ctrl+Y or Ctrl+Shift+Z) reverse deleting,
+removing offline / geo-blocked / duplicate channels, renaming channels and
+groups, moving channels, ticking groups or playlists, pasting and Clear list.
+Check results are never undone. The Edit menu shows the change that will be
+undone or redone; the last 30 changes are kept (with a limit for huge lists).
+.SH REMEMBERED RESULTS
+With Settings \(-> Remember check results between sessions (on by default),
+the result of every final check is stored and shown again when the same stream
+is opened later. Such rows are in italics and the Check result column starts
+with "last check ..." and the age of the result.
+.PP
+A result belongs to the stream address together with the User-Agent, Referer
+and other headers used for the check: changing the User-Agent in Settings means
+that results checked with the old User-Agent are not shown until the stream is
+checked again. The file stores only hashed stream keys, no addresses, logins or
+tokens.
+.PP
+An online or offline result from an earlier session is treated as "not checked"
+when removing offline channels, choosing which duplicate to keep or saving a
+playlist, so an old result cannot silently lose a stream; the program notes this
+in the dialogs. A geo-block is kept because it depends on the country rather
+than on the stream. After a check, channels whose result changed are bold, and
+Show \(-> Changed since the last check filters them.
+.PP
+Settings \(-> Forget remembered check results deletes the stored history.
+Results of the current session stay in the list but are not stored again
+unless the channel is checked again (or marked by hand).
+.SH THEME
+Settings \(-> Theme offers Same as the system, Light and Dark. Windows, menus,
+tables, check boxes and dialogs follow the choice. Same as the system follows
+the desktop's dark-mode setting on Linux, Windows and macOS.
 .SH PLAYLIST COLORS
 Every playlist gets its own color: a colored square at the start of each
 channel row and, unless switched off in Settings \(-> Tint rows with the
@@ -109,6 +152,10 @@ channel (#EXTVLCOPT:http-user-agent or url|User-Agent=...) always wins.
 .TP
 .I ~/.config/playlist-checker/settings.json
 User settings (check timeout, User-Agent, duplicate rules, Settings menu options).
+.TP
+.I ~/.config/playlist-checker/results.json
+Remembered check results, under hashed stream keys (no addresses or logins).
+Delete it or use Settings \(-> Forget remembered check results to clear them.
 .SH TEMPORARY ERRORS
 Servers sometimes fail for a moment (timeout, HTTP 502, 503 or 504 "Gateway
 Timeout", connection reset). With Settings \(-> Try again channels with
